@@ -6,6 +6,9 @@
   "main": "lib/node.cjs",
   "module": "lib/index.mjs",
   "types": "lib/node.d.ts",
+  "repository": {
+    "url": "git+https://github.com/Hoshino-Yumetsuki/moejs-wasm.git"
+  },
   "exports": {
     ".": {
       "workerd": {
