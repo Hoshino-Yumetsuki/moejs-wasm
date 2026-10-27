@@ -1,0 +1,109 @@
+{
+  "name": "moejs-wasm",
+  "version": "1.0.0-beta.1",
+  "description": "Isolated MoeJS JavaScript and TypeScript runtimes powered by Go WebAssembly workers",
+  "type": "module",
+  "main": "lib/node.cjs",
+  "module": "lib/index.mjs",
+  "types": "lib/node.d.ts",
+  "exports": {
+    ".": {
+      "workerd": {
+        "types": {
+          "import": "./lib/cloudflare.d.ts",
+          "require": "./lib/cloudflare.d.cts"
+        },
+        "import": "./lib/cloudflare.mjs",
+        "require": "./lib/cloudflare.cjs"
+      },
+      "browser": {
+        "types": {
+          "import": "./lib/index.d.ts",
+          "require": "./lib/index.d.cts"
+        },
+        "import": "./lib/index.mjs",
+        "require": "./lib/index.cjs"
+      },
+      "node": {
+        "types": {
+          "import": "./lib/node.d.ts",
+          "require": "./lib/node.d.cts"
+        },
+        "import": "./lib/node.mjs",
+        "require": "./lib/node.cjs"
+      },
+      "types": {
+        "import": "./lib/index.d.ts",
+        "require": "./lib/index.d.cts"
+      },
+      "import": "./lib/index.mjs",
+      "require": "./lib/index.cjs"
+    },
+    "./node": {
+      "types": {
+        "import": "./lib/node.d.ts",
+        "require": "./lib/node.d.cts"
+      },
+      "import": "./lib/node.mjs",
+      "require": "./lib/node.cjs"
+    },
+    "./browser": {
+      "types": {
+        "import": "./lib/index.d.ts",
+        "require": "./lib/index.d.cts"
+      },
+      "import": "./lib/index.mjs",
+      "require": "./lib/index.cjs"
+    },
+    "./cloudflare": {
+      "types": {
+        "import": "./lib/cloudflare.d.ts",
+        "require": "./lib/cloudflare.d.cts"
+      },
+      "import": "./lib/cloudflare.mjs",
+      "require": "./lib/cloudflare.cjs"
+    },
+    "./wasm": {
+      "types": {
+        "import": "./lib/wasm.d.ts",
+        "require": "./lib/wasm.d.cts"
+      },
+      "import": "./lib/wasm.mjs",
+      "require": "./lib/wasm.cjs"
+    },
+    "./package.json": "./package.json",
+    "./worker.mjs": "./lib/worker.mjs",
+    "./moejs.wasm": "./lib/moejs.wasm",
+    "./go-shim.mjs": "./lib/go-shim.mjs",
+    "./wasm_exec.js": "./lib/wasm_exec.js"
+  },
+  "files": [
+    "lib",
+    "LICENSE-*"
+  ],
+  "scripts": {
+    "build": "tsdown && node scripts/build-wasm.mjs",
+    "lint": "oxlint",
+    "lint-fix": "oxlint --fix && oxfmt",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
+    "test": "vitest run --root test"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "miniflare": "^4.20260730.0",
+    "oxfmt": "^0.71.0",
+    "oxlint": "^1.86.0",
+    "oxlint-tsgolint": "^7.0.2003",
+    "rolldown": "^1.2.15",
+    "tsdown": "^0.23.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "Apache-2.0",
+  "packageManager": "yarn@4.18.1+sha512.b2e1e7524f654f2749d32b4ebcb4622473cb5bcbc485df2007e12a154e50162a4d795526768bc5f5b8f81717bfd79deb2472813d86fb5ae2eb551fa9c872b08f"
+}

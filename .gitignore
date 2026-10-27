@@ -1,0 +1,8 @@
+node_modules/
+lib/
+coverage/
+.yarn/
+!.yarn/patches/
+.wrangler/
+.VSCodeCounter
+bridge/native_registry.go
