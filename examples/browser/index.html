@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" />
+  <title>MoeJS WASM browser adapter</title>
+  <h1>MoeJS WASM</h1>
+  <pre id="result">正在加载 WASM…</pre>
+  <script type="module">
+    import { createMoeJS } from "../../lib/index.mjs"
+    const result = document.querySelector("#result")
+    let engine
+    try {
+      engine = await createMoeJS({ timeoutMs: 5000 })
+      const module = await engine.compile(
+        "browser.js",
+        `
+      export async function greet(name) {
+        const { promise, resolve } = Promise.withResolvers()
+        setTimeout(resolve, 1)
+        await promise
+        return await host.prefix() + name
+      }
+      export function capabilities() { return [typeof window, typeof document] }
+      export async function native() {
+        const response = new Response("browser native response")
+        return { text: await response.text(), host: new URL("https://example.test/path").host, url: import.meta.url }
+      }
+    `
+      )
+      const runtime = await engine.newRuntime({
+        importer: { meta: (module) => ({ url: module.name }) }
+      })
+      await runtime.setGlobal("host", { prefix: () => "Hello, " })
+      await runtime.load(module)
+      const greeting = await runtime.call(module.hook("greet"), "WASM")
+      const capabilities = await runtime.call(module.hook("capabilities"))
+      const native = await runtime.call(module.hook("native"))
+      result.textContent = JSON.stringify({ greeting, capabilities, native }, null, 2)
+      result.dataset.status = "passed"
+    } catch (error) {
+      result.textContent = error.stack ?? String(error)
+      result.dataset.status = "failed"
+    } finally {
+      await engine?.close()
+    }
+  </script>
+</html>
