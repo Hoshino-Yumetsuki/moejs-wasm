@@ -46,7 +46,7 @@ export default {
       try {
         await runtime.call(linked.hook("spin"))
       } catch (error) {
-        exhaustion = error.kind
+        exhaustion = error.cause?.kind
       }
       return Response.json({ greeting, capabilities, native, exhaustion })
     } finally {

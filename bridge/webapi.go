@@ -7,43 +7,74 @@ import (
 	"errors"
 	"net/http"
 	"sync"
-	"syscall/js"
+	"time"
 
 	"github.com/Calcium-Ion/moejs/webapi"
 )
 
 type networkOptions struct {
 	AllowHosts    []string `json:"allowHosts"`
+	AllowHostsSet bool     `json:"allowHostsSet"`
 	AllowCallback bool     `json:"allowCallback"`
+	CustomFetch   bool     `json:"customFetch"`
+	TimeoutMs     int64    `json:"timeoutMs"`
+	CheckRedirect bool     `json:"checkRedirect"`
+	Jar           bool     `json:"jar"`
 }
 
 type networkPayload struct {
-	NetworkContext *int `json:"networkContext"`
+	NetworkContext *int           `json:"networkContext"`
+	Reason         *networkReason `json:"reason"`
+}
+
+type networkReason struct {
+	Name    string `json:"name"`
+	Message string `json:"message"`
+}
+
+// cause maps an AbortSignal reason to the context idiom a Go host would use.
+func (r *networkReason) cause() error {
+	switch {
+	case r == nil || r.Name == "AbortError":
+		return context.Canceled
+	case r.Name == "TimeoutError":
+		return context.DeadlineExceeded
+	}
+	return errors.New(r.Message)
 }
 
 type networkState struct {
 	networkMu           sync.Mutex
-	networkParentCancel context.CancelFunc
-	networkContexts     map[int]context.CancelFunc
+	networkParentCancel context.CancelCauseFunc
+	networkContexts     map[int]context.CancelCauseFunc
 }
 
-func (b *bridge) installWebAPI(p payload) error {
-	parent, cancel := context.WithCancel(context.Background())
-	b.networkParentCancel = cancel
-	b.networkContexts = make(map[int]context.CancelFunc)
+func (b *bridge) installWebAPI(p *payload) error {
+	if b.webAPI != nil {
+		return wireError("webapi: already installed")
+	}
+	parent, cancel := context.WithCancelCause(context.Background())
 	opts := webapi.Options{Context: parent}
-	if p.Network != nil {
-		allowedHost := webapi.AllowHosts(p.Network.AllowHosts...)
-		if len(p.Network.AllowHosts) != 0 || p.Network.AllowCallback {
-			opts.Client = &http.Client{}
+	if n := p.Network; n != nil {
+		// Like a non-nil Client with a nil Allow, a custom fetch alone enables the network.
+		if len(n.AllowHosts) != 0 || n.AllowCallback || n.CustomFetch {
+			client := &http.Client{Transport: hostTransport{}, Timeout: time.Duration(n.TimeoutMs) * time.Millisecond}
+			if n.CheckRedirect {
+				client.CheckRedirect = hostCheckRedirect
+			}
+			if n.Jar {
+				client.Jar = hostJar{parent}
+			}
+			opts.Client = client
 		}
+		allowedHost := webapi.AllowHosts(n.AllowHosts...)
 		opts.Allow = func(req *http.Request) error {
-			if len(p.Network.AllowHosts) != 0 {
+			if n.AllowHostsSet {
 				if err := allowedHost(req); err != nil {
 					return err
 				}
 			}
-			if p.Network.AllowCallback {
+			if n.AllowCallback {
 				return allowHostRequest(req)
 			}
 			return nil
@@ -51,70 +82,47 @@ func (b *bridge) installWebAPI(p payload) error {
 	}
 	api, err := webapi.Install(b.loop, opts)
 	if err != nil {
-		cancel()
+		cancel(nil)
 		return err
 	}
 	b.webAPI = api
+	b.networkParentCancel = cancel
+	b.networkContexts = make(map[int]context.CancelCauseFunc)
 	return nil
 }
 
 // The hook runs on net/http's goroutine, before the native client's initial
 // request and each redirect. No host callback becomes a guest global.
 func allowHostRequest(req *http.Request) error {
-	headers := make([][2]string, 0, len(req.Header)+1)
-	for name, values := range req.Header {
-		for _, value := range values {
-			headers = append(headers, [2]string{name, value})
-		}
-	}
-	if req.Host != "" {
-		headers = append(headers, [2]string{"Host", req.Host})
-	}
-	result := make(chan error, 1)
-	resolve := js.FuncOf(func(_ js.Value, _ []js.Value) any { result <- nil; return nil })
-	reject := js.FuncOf(func(_ js.Value, args []js.Value) any {
-		message := "Network request denied by host policy"
-		if len(args) != 0 {
-			message = args[0].String()
-		}
-		result <- errors.New(message)
-		return nil
-	})
-	promise := js.Global().Call("__moeNetworkAllow", marshal(map[string]any{
-		"url": req.URL.String(), "method": req.Method, "headers": headers,
-	}))
-	promise.Call("then", resolve, reject)
-	select {
-	case err := <-result:
-		resolve.Release()
-		reject.Release()
-		return err
-	case <-req.Context().Done():
-		promise.Call("cancel")
-		// The JS side can still finish its hook; retain callbacks until then.
-		go func() { <-result; resolve.Release(); reject.Release() }()
-		return req.Context().Err()
-	}
+	_, err := awaitNetwork(req.Context(), host.networkAllow.Invoke(marshal(requestSnapshot(req))), "")
+	return err
 }
 
-func (b *bridge) dispatchNetwork(op string, p payload) (operationResult, bool, error) {
+func (b *bridge) dispatchNetwork(op string, p *payload) (operationResult, bool, error) {
+	switch op {
+	case "networkClose", "networkCancelParent", "networkSetContext", "networkCancelContext":
+		// A runtime without Web APIs has nothing to close or cancel.
+		if b.webAPI == nil {
+			return operationResult{}, true, nil
+		}
+	}
 	switch op {
 	case "networkClose":
 		b.closeWebAPI()
 	case "networkCancelParent":
 		b.networkMu.Lock()
 		if b.networkParentCancel != nil {
-			b.networkParentCancel()
+			b.networkParentCancel(p.Reason.cause())
 		}
 		b.networkMu.Unlock()
 	case "networkSetContext":
 		b.networkMu.Lock()
 		if p.NetworkContext == nil {
-			b.webAPI.SetContext(context.TODO())
+			b.webAPI.SetContext(nil)
 		} else {
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancelCause(context.Background())
 			if old := b.networkContexts[*p.NetworkContext]; old != nil {
-				old()
+				old(nil)
 			}
 			b.networkContexts[*p.NetworkContext] = cancel
 			b.webAPI.SetContext(ctx)
@@ -124,7 +132,7 @@ func (b *bridge) dispatchNetwork(op string, p payload) (operationResult, bool, e
 		b.networkMu.Lock()
 		if p.NetworkContext != nil {
 			if cancel := b.networkContexts[*p.NetworkContext]; cancel != nil {
-				cancel()
+				cancel(p.Reason.cause())
 				delete(b.networkContexts, *p.NetworkContext)
 			}
 		}
@@ -141,10 +149,10 @@ func (b *bridge) closeWebAPI() {
 	}
 	b.networkMu.Lock()
 	if b.networkParentCancel != nil {
-		b.networkParentCancel()
+		b.networkParentCancel(nil)
 	}
 	for id, cancel := range b.networkContexts {
-		cancel()
+		cancel(nil)
 		delete(b.networkContexts, id)
 	}
 	b.networkMu.Unlock()

@@ -13,6 +13,7 @@ it("runs native timers, cancellation, interval arguments and top-level await", a
       const ready = Promise.withResolvers()
       setTimeout(ready.resolve, 1, 40)
       const initial = await ready.promise
+      host.loaded()
       export async function run() {
         let cancelled = false
         const timeout = setTimeout(() => { cancelled = true }, 1)
@@ -34,7 +35,10 @@ it("runs native timers, cancellation, interval arguments and top-level await", a
     `
     )
     const runtime = await engine.newRuntime()
-    await runtime.load(mod)
+    const loaded = Promise.withResolvers<void>()
+    await runtime.setGlobal("host", { loaded: () => loaded.resolve() })
+    await expect(runtime.load(mod)).rejects.toMatchObject({ code: "ERR_MODULE_PENDING" })
+    await loaded.promise
     expect(await runtime.call(mod.hook("run"))).toEqual({ value: 46, cancelled: false })
   } finally {
     await engine.close()
@@ -65,7 +69,7 @@ it("observes pending promises without reading guest constructors or species", as
   }
 }, 30_000)
 
-it("propagates uncaught timer errors and does not replenish execution fuel across timers", async () => {
+it("propagates uncaught timer errors", async () => {
   const engine = await createMoeJS({ timeoutMs: 10_000 })
   try {
     const mod = await engine.compile(
@@ -75,14 +79,6 @@ it("propagates uncaught timer errors and does not replenish execution fuel acros
         setTimeout(() => { throw new RangeError("timer failed") }, 1)
         return Promise.withResolvers().promise
       }
-      export async function spin() {
-        try { for (;;) {
-          const { promise, resolve } = Promise.withResolvers()
-          setTimeout(resolve, 1)
-          await promise
-        } }
-        catch { return "escaped" }
-      }
     `
     )
     const failing = await engine.newRuntime()
@@ -91,9 +87,92 @@ it("propagates uncaught timer errors and does not replenish execution fuel acros
       name: "RangeError",
       message: "timer failed"
     })
-    const limited = await engine.newRuntime({ maxSteps: 1000 })
-    await limited.load(mod)
-    await expect(limited.call(mod.hook("spin"))).rejects.toMatchObject({ kind: "budget" })
+  } finally {
+    await engine.close()
+  }
+}, 30_000)
+
+it("gives every timer, immediate and interval callback a fresh step budget", async () => {
+  const engine = await createMoeJS({ timeoutMs: 10_000 })
+  try {
+    const mod = await engine.compile(
+      "timer-budget.js",
+      `
+      function burn() { let t = 0; for (let i = 0; i < 500; i++) t += i; return t }
+      export async function timers(n) { for (let i = 0; i < n; i++) { const g = Promise.withResolvers(); setTimeout(() => g.resolve(burn()), 1); await g.promise } return n }
+      export async function immediates(n) { for (let i = 0; i < n; i++) { const g = Promise.withResolvers(); setImmediate(() => g.resolve(burn())); await g.promise } return n }
+      export function interval(n) { const g = Promise.withResolvers(); let k = 0; const id = setInterval(() => { burn(); if (++k === n) { clearInterval(id); g.resolve(k) } }, 1); return g.promise }
+      export function runaway() { setTimeout(() => { for (;;) {} }, 1); return Promise.withResolvers().promise }
+      export function burnAll(n) { for (let i = 0; i < n; i++) burn(); return n }
+    `
+    )
+    const runtime = await engine.newRuntime({ maxSteps: 10_000 })
+    await runtime.load(mod)
+    await expect(runtime.call(mod.hook("burnAll"), 50)).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "budget" }
+    })
+    await runtime.clearInterrupt()
+    await runtime.eventLoop.start()
+    expect(await runtime.call(mod.hook("timers"), 50)).toBe(50)
+    expect(await runtime.call(mod.hook("immediates"), 50)).toBe(50)
+    expect(await runtime.call(mod.hook("interval"), 50)).toBe(50)
+    await expect(runtime.call(mod.hook("runaway"))).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "budget" }
+    })
+  } finally {
+    await engine.close()
+  }
+}, 30_000)
+
+it("refills the step budget for timers that resume after clearInterrupt", async () => {
+  const engine = await createMoeJS({ timeoutMs: 10_000 })
+  try {
+    const mod = await engine.compile(
+      "resume-budget.js",
+      `
+      let fired = false
+      export function arm() { setTimeout(() => { fired = true }, 200); setTimeout(() => { for (;;) {} }, 1); return Promise.withResolvers().promise }
+      export function wasFired() { return fired }
+    `
+    )
+    const runtime = await engine.newRuntime({ maxSteps: 1000 })
+    await runtime.load(mod)
+    await expect(runtime.call(mod.hook("arm"))).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "budget" }
+    })
+    await runtime.clearInterrupt()
+    await runtime.eventLoop.run()
+    expect(await runtime.call(mod.hook("wasFired"))).toBe(true)
+  } finally {
+    await engine.close()
+  }
+}, 30_000)
+
+it("runs the event loop without a default deadline unless one is set", async () => {
+  const engine = await createMoeJS()
+  try {
+    const mod = await engine.compile(
+      "long-run.js",
+      `
+      let fired = false
+      export function arm(ms) { setTimeout(() => { fired = true }, ms) }
+      export function wasFired() { return fired }
+    `
+    )
+    const runtime = await engine.newRuntime()
+    await runtime.load(mod)
+    await runtime.eventLoop.stop()
+    await runtime.call(mod.hook("arm"), 1200)
+    await runtime.eventLoop.run()
+    expect(await runtime.call(mod.hook("wasFired"))).toBe(true)
+    await runtime.call(mod.hook("arm"), 60_000)
+    await expect(runtime.eventLoop.run({ timeoutMs: 50 })).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "timeout" }
+    })
   } finally {
     await engine.close()
   }

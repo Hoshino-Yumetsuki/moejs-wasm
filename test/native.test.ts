@@ -218,7 +218,7 @@ describe("runtime-owned Go reflection handles", () => {
     expect(JSON.parse(new TextDecoder().decode(Uint8Array.from(output)))).toEqual(data)
   }, 40_000)
 
-  it("measures guest values retained only by native environment slots and parents", async () => {
+  it("keeps guest values held only by native environment slots unmeasured unless rooted", async () => {
     const { runtime, realm } = await setup()
     const namespace = await runtime.native("engine")
     const parent = await namespace.invoke<NativeHandle>("NewEnv", null, 1)
@@ -229,19 +229,16 @@ describe("runtime-owned Go reflection handles", () => {
     await value.release()
     await parent.release()
     await runtime.releaseCallData()
-    const after = await realm.invoke<number>("MeasureLive", null)
-    expect(after - before).toBeGreaterThanOrEqual(200_000)
+    // As upstream, MeasureLive counts what guest code and registered roots reach.
+    expect((await realm.invoke<number>("MeasureLive", null)) - before).toBeLessThan(200_000)
     const retainedParent = await child.invoke<NativeHandle>("Parent")
     const retained = await retainedParent.invoke<NativeHandle>("Slot", 0)
     const guest = await retained.asValue()
     expect(await guest.export()).toBe("root".repeat(50_000))
+    expect((await runtime.measureLive([guest])) - before).toBeGreaterThanOrEqual(200_000)
     await guest.release()
     await retainedParent.invoke("SetSlot", 0, undefined)
     await retained.release()
-    await runtime.releaseCallData()
-    expect(after - (await realm.invoke<number>("MeasureLive", null))).toBeGreaterThanOrEqual(
-      200_000
-    )
   }, 40_000)
 
   it("allocates actual Go structs with JSON tags, slices, maps, pointers and exact integers", async () => {
@@ -424,4 +421,22 @@ describe("runtime-owned Go reflection handles", () => {
     expect(measured - baseline).toBeGreaterThanOrEqual(200_000)
     await remove.call()
   }, 40_000)
+
+  it("drops the jobs a panicking native operation left queued", async () => {
+    const { runtime, root, realm } = await setup()
+    await root.invoke("SetPromiseRejectionTracker", () => {
+      throw new Error("tracker bug")
+    })
+    const fn = await runtime.evalScriptValue(
+      "queue.js",
+      "() => { Promise.resolve().then(() => { Promise.reject(1) }); Promise.resolve().then(() => { globalThis.ran = true }) }"
+    )
+    await expect(realm.invoke("Call", fn, undefined, [])).rejects.toMatchObject({
+      kind: "internal",
+      name: "InternalError"
+    })
+    await root.invoke("SetPromiseRejectionTracker", null)
+    await runtime.evalScript("next.js", "0")
+    expect(await runtime.evalScript("read.js", "globalThis.ran")).toBeUndefined()
+  }, 30_000)
 })

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest"
 import { createMoeJS, MoeJSError, type Engine } from "moejs-wasm"
+import { nodeAdapter, type Adapter } from "moejs-wasm/node"
 
 const engines: Engine[] = []
 afterEach(async () => {
@@ -82,6 +83,7 @@ describe("real MoeJS WASM runtimes", () => {
       "host.ts",
       `
       const prefix: string = await host.prefix()
+      host.loaded()
       export async function run(value: number): Promise<string> {
         return prefix + await host.double(value)
       }
@@ -92,14 +94,17 @@ describe("real MoeJS WASM runtimes", () => {
     `
     )
     const rt = await engine.newRuntime()
+    const done = Promise.withResolvers<void>()
     await rt.setGlobal("host", {
       prefix: async () => "answer:",
+      loaded: () => done.resolve(),
       double: async (n: unknown) => Number(n) * 2,
       fail: () => {
         throw new Error("host denied")
       }
     })
-    await rt.load(mod)
+    await expect(rt.load(mod)).rejects.toMatchObject({ code: "ERR_MODULE_PENDING" })
+    await done.promise
     expect(await rt.call(mod.hook("run"), 21)).toBe("answer:42")
     expect(await rt.call(mod.hook("recover"))).toBe("host denied")
     await expect(rt.call(mod.hook("reject"))).rejects.toMatchObject({
@@ -155,30 +160,111 @@ describe("real MoeJS WASM runtimes", () => {
     )
     const rt = await engine.newRuntime({ maxSteps: 10_000 })
     await rt.load(mod)
-    await expect(rt.call(mod.hook("spin"))).rejects.toMatchObject({ kind: "budget" })
+    await expect(rt.call(mod.hook("spin"))).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "budget" }
+    })
     const limited = await engine.newRuntime({ memoryLimit: 1_000_000 })
     await limited.load(mod)
-    await expect(limited.call(mod.hook("allocate"))).rejects.toMatchObject({ kind: "memory" })
+    await expect(limited.call(mod.hook("allocate"))).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "memory" }
+    })
     const fresh = await engine.newRuntime()
     await fresh.load(mod)
     expect(await fresh.call(mod.hook("ok"))).toBe(42)
   }, 30_000)
 
-  it("does not replenish CPU fuel when host promises settle", async () => {
+  it("gives each host promise settlement a fresh step budget", async () => {
     const engine = await create()
     const mod = await engine.compile(
       "async-budget.js",
       `
-      export async function spin() {
-        try { for (;;) { await host.tick() } }
-        catch { return "escaped" }
-      }
+      function burn() { let t = 0; for (let i = 0; i < 500; i++) t += i; return t }
+      export async function ticks(n) { for (let i = 0; i < n; i++) { await host.tick(); burn() } return n }
+      export async function runaway() { await host.tick(); for (;;) {} }
+      export function burnAll(n) { for (let i = 0; i < n; i++) burn(); return n }
     `
     )
-    const rt = await engine.newRuntime({ maxSteps: 1000 })
+    const rt = await engine.newRuntime({ maxSteps: 10_000 })
     await rt.setGlobal("host", { tick: async () => null })
     await rt.load(mod)
-    await expect(rt.call(mod.hook("spin"))).rejects.toMatchObject({ kind: "budget" })
+    await expect(rt.call(mod.hook("burnAll"), 50)).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "budget" }
+    })
+    await rt.clearInterrupt()
+    expect(await rt.call(mod.hook("ticks"), 50)).toBe(50)
+    await expect(rt.call(mod.hook("runaway"))).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "budget" }
+    })
+  }, 30_000)
+
+  it("treats maxSteps 0 or a negative value as no limit, like MemoryLimit", async () => {
+    const engine = await create()
+    const mod = await engine.compile(
+      "unbounded.js",
+      `
+      export function count(n) { let i = 0; while (i < n) i++; return i }
+      export function allocate() { return new Array(1_000_000).fill("x").length }
+    `
+    )
+    const limited = await engine.newRuntime()
+    await limited.load(mod)
+    await expect(limited.call(mod.hook("count"), 2_000_000)).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "budget" }
+    })
+    for (const maxSteps of [0, -1]) {
+      const rt = await engine.newRuntime({ maxSteps, memoryLimit: -1 })
+      await rt.load(mod)
+      expect(await rt.call(mod.hook("count"), 2_000_000)).toBe(2_000_000)
+      expect(await rt.call(mod.hook("allocate"))).toBe(1_000_000)
+      expect((await rt.stats()).MemoryLimitHits).toBe(0)
+    }
+    await expect(engine.newRuntime({ maxSteps: Infinity })).rejects.toThrow(RangeError)
+    await expect(engine.newRuntime({ maxSteps: 1.5 })).rejects.toThrow(RangeError)
+  }, 30_000)
+
+  it("stops a module whose evaluation runs out of steps instead of timing out", async () => {
+    const engine = await create()
+    const mod = await engine.compile("tiny.js", "export const answer = 42")
+    for (const maxSteps of [1, 2, 3]) {
+      const rt = await engine.newRuntime({ maxSteps })
+      await expect(rt.load(mod)).rejects.toMatchObject({
+        kind: "interrupted",
+        cause: { kind: "budget" }
+      })
+    }
+  }, 30_000)
+
+  it("waits to measure call arguments as fromHost does, so oversized arguments stop the request", async () => {
+    const engine = await create()
+    const mod = await engine.compile(
+      "size.js",
+      "export function size(items) { return items.length }"
+    )
+    const big = Array.from({ length: 100_000 }, (_, i) => ({ i }))
+    const unlimited = await engine.newRuntime()
+    const before = await unlimited.measureLive()
+    const kept = await unlimited.fromHost(big)
+    expect((await unlimited.measureLive([kept])) - before).toBeGreaterThan(1_500_000)
+    await kept.release()
+    const limited = await engine.newRuntime({ memoryLimit: 1_000_000 })
+    await limited.load(mod)
+    await expect(limited.call(mod.hook("size"), big)).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "memory" }
+    })
+    const copied = await engine.newRuntime({ memoryLimit: 1_000_000 })
+    await expect(copied.fromHost(big)).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "memory" }
+    })
+    const small = await engine.newRuntime({ memoryLimit: 1_000_000 })
+    await small.load(mod)
+    expect(await small.call(mod.hook("size"), big.slice(0, 1_000))).toBe(1_000)
   }, 30_000)
 
   it("keeps the memory budget across reentrant SetGlobal calls", async () => {
@@ -204,7 +290,10 @@ describe("real MoeJS WASM runtimes", () => {
       })
     )
     await runtime.load(mod)
-    await expect(runtime.call(mod.hook("allocate"))).rejects.toMatchObject({ kind: "memory" })
+    await expect(runtime.call(mod.hook("allocate"))).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "memory" }
+    })
   }, 30_000)
 
   it("preserves host callback error cause chains through guest exceptions", async () => {
@@ -269,6 +358,54 @@ describe("real MoeJS WASM runtimes", () => {
     30_000
   )
 
+  it("hands warm runtime endpoints to newRuntime and replaces them", async () => {
+    await expect(createMoeJS({ warmRuntimes: -1 })).rejects.toThrow(RangeError)
+    const engine = await createMoeJS({ timeoutMs: 10_000, warmRuntimes: 1 })
+    engines.push(engine)
+    const mod = await engine.compile("warm.js", "export const tenant = () => globalThis.tenant")
+    const [a, b] = await Promise.all([engine.newRuntime(), engine.newRuntime()])
+    await Promise.all([a.setGlobal("tenant", "a"), b.setGlobal("tenant", "b")])
+    await Promise.all([a.load(mod), b.load(mod)])
+    expect(await a.call(mod.hook("tenant"))).toBe("a")
+    expect(await b.call(mod.hook("tenant"))).toBe("b")
+    await a.close()
+    const c = await engine.newRuntime()
+    await c.load(mod)
+    expect(await c.call(mod.hook("tenant"))).toBeUndefined()
+  }, 30_000)
+
+  it("replaces warm runtime endpoints that fail, but not endlessly", async () => {
+    const native = nodeAdapter()
+    let created = 0
+    let failing = 1
+    const adapter: Adapter = {
+      loadModule: (url) => native.loadModule(url),
+      createWorker(module, options, handlers) {
+        // The first endpoint is the compiler.
+        if (created++ > 0 && failing-- > 0) return Promise.reject(new Error("no worker"))
+        return native.createWorker(module, options, handlers)
+      }
+    }
+    const until = async (done: () => boolean) => {
+      for (let i = 0; i < 200 && !done(); i++)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    const engine = await createMoeJS({ timeoutMs: 10_000, warmRuntimes: 1, adapter })
+    engines.push(engine)
+    await until(() => created === 3)
+    expect(created).toBe(3)
+    const runtime = await engine.newRuntime()
+    expect(await runtime.evalScript("probe.js", "1 + 1")).toBe(2)
+
+    created = 0
+    failing = Infinity
+    const broken = await createMoeJS({ timeoutMs: 10_000, warmRuntimes: 1, adapter })
+    engines.push(broken)
+    await until(() => created >= 3)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(created).toBe(3)
+  }, 30_000)
+
   it("bounds pending promises and can close an outstanding call immediately", async () => {
     const engine = await create()
     const mod = await engine.compile(
@@ -277,12 +414,52 @@ describe("real MoeJS WASM runtimes", () => {
     )
     const rt = await engine.newRuntime({ timeoutMs: 1000 })
     await rt.load(mod)
-    await expect(rt.call(mod.hook("wait"))).rejects.toMatchObject({ kind: "timeout" })
+    await expect(rt.call(mod.hook("wait"))).rejects.toMatchObject({
+      kind: "interrupted",
+      cause: { kind: "timeout" }
+    })
     const other = await engine.newRuntime()
     await other.load(mod)
     const pending = other.call(mod.hook("wait"))
     const assertion = expect(pending).rejects.toMatchObject({ kind: "closed" })
     await other.close()
     await assertion
+  }, 30_000)
+
+  it("starts a new allocation budget after a top-level setGlobal and keeps the count when it fails", async () => {
+    const engine = await create()
+    const runtime = await engine.newRuntime({ memoryLimit: 5_000_000 })
+    await runtime.setGlobal(
+      "table",
+      Array.from({ length: 2000 }, (_, i) => ({ i, label: `row ${i}` }))
+    )
+    expect((await runtime.stats()).RequestAllocatedBytes).toBe(0)
+    await runtime.evalScript(
+      "trap.js",
+      'Object.defineProperty(globalThis, "trap", { set() { throw new Error("refused") } }); undefined'
+    )
+    await expect(
+      runtime.setGlobal(
+        "trap",
+        Array.from({ length: 2000 }, (_, i) => i)
+      )
+    ).rejects.toMatchObject({ kind: "exception", message: "refused" })
+    expect((await runtime.stats()).RequestAllocatedBytes).toBeGreaterThan(0)
+  }, 30_000)
+
+  it("rejects host bigints over the 2^20-bit BigInt limit", async () => {
+    const engine = await create()
+    const mod = await engine.compile("bigint.js", "export const kind = (n) => typeof n")
+    const runtime = await engine.newRuntime()
+    await runtime.load(mod)
+    const tooBig = {
+      kind: "exception",
+      name: "RangeError",
+      message: "Maximum BigInt size exceeded"
+    }
+    expect(await runtime.call(mod.hook("kind"), 1n << 1048575n)).toBe("bigint")
+    await expect(runtime.fromHost(1n << 1048576n)).rejects.toMatchObject(tooBig)
+    await expect(runtime.setGlobal("big", 1n << 1048576n)).rejects.toMatchObject(tooBig)
+    await expect(runtime.call(mod.hook("kind"), 1n << (1n << 21n))).rejects.toMatchObject(tooBig)
   }, 30_000)
 })

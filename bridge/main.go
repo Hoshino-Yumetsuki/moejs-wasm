@@ -5,8 +5,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,26 +16,47 @@ import (
 
 	"github.com/Calcium-Ion/moejs"
 	"github.com/Calcium-Ion/moejs/bytecode"
-	"github.com/Calcium-Ion/moejs/engine"
 )
 
 const defaultMaxSteps int64 = 1_000_000
 
 var errExecutionBudget = errors.New("moejs: execution budget exceeded")
 
-func setExecutionBudget(realm *moejs.Realm, steps int64) {
-	// The build overlay adds this method without modifying the upstream checkout.
-	limiter, ok := any(realm).(interface{ SetExecutionBudget(int64, error) })
+// realmBudget is what scripts/build-wasm.mjs adds to engine.Realm.
+type realmBudget interface {
+	SetExecutionBudget(steps int64, exhausted error)
+	RefillExecutionBudget()
+	BeginHolding() bool
+	EndHolding(began bool)
+}
+
+func budgetOf(realm *moejs.Realm) realmBudget {
+	budget, ok := any(realm).(realmBudget)
 	if !ok {
 		panic("execution budget support missing: build with scripts/build-wasm.mjs")
 	}
-	limiter.SetExecutionBudget(steps, errExecutionBudget)
+	return budget
+}
+
+func compileBudget(p *payload) int64 {
+	if p.MaxSteps != nil {
+		if *p.MaxSteps <= 0 {
+			return -1
+		}
+		return *p.MaxSteps
+	}
+	// Dense generated code uses about one compile checkpoint per 25 bytes.
+	return max(defaultMaxSteps, int64(len(p.Source)+len(p.Params)+len(p.Body))/8)
 }
 
 type request struct {
-	ID      int             `json:"id"`
-	Op      string          `json:"op"`
-	Payload json.RawMessage `json:"payload"`
+	ID         int
+	Op         string
+	Payload    json.RawMessage
+	p          payload
+	payloadErr error
+	decoded    bool
+	nested     bool
 }
 
 type payload struct {
@@ -46,6 +67,7 @@ type payload struct {
 	networkPayload
 	nativePayload
 	Reentrant          bool            `json:"reentrant"`
+	Held               bool            `json:"held"`
 	ModuleID           int             `json:"moduleId"`
 	ScriptID           int             `json:"scriptId"`
 	Name               string          `json:"name"`
@@ -61,15 +83,17 @@ type payload struct {
 	DisableDynamicCode bool            `json:"disableDynamicCode"`
 	MaxDynamicSource   int             `json:"maxDynamicSource"`
 	Locale             string          `json:"locale"`
-	TimeZone           string          `json:"timeZone"`
+	TimeZone           *string         `json:"timeZone"`
 	MaxSteps           *int64          `json:"maxSteps"`
 	Network            *networkOptions `json:"network"`
+	WebAPI             *bool           `json:"webAPI"`
+	GCPercent          *int            `json:"gcPercent"`
+	GoMemoryLimit      *int64          `json:"goMemoryLimit"`
 }
 
 type compiledModule struct {
 	moduleInfo
 	code     *bytecode.Function
-	graph    *engine.ModuleGraph
 	name     string
 	exports  []string
 	requests []string
@@ -79,12 +103,13 @@ type hostCall struct {
 	promise moejs.Value
 	resolve func(moejs.Value) error
 	reject  func(moejs.Value) error
+	release func(func(*moejs.Runtime))
+	temps   []int
 }
 
 type pendingOperation struct {
 	id       int
 	promise  moejs.Value
-	load     bool
 	observed *moejs.Object
 }
 
@@ -95,6 +120,12 @@ type operationResult struct {
 	raw      bool
 }
 
+type jsCallbacks struct {
+	message, networkAllow, network js.Value
+}
+
+var host jsCallbacks
+
 type bridge struct {
 	loopState
 	moduleState
@@ -102,43 +133,93 @@ type bridge struct {
 	controlState
 	networkState
 	nativeState
+	releaseState
+	preemptState
 	rt             *moejs.Runtime
 	modules        map[int]*compiledModule
 	scripts        map[int]*bytecode.Function
 	hostCalls      map[int]hostCall
 	shutdown       chan struct{}
+	idle           chan string
 	nextHostCall   int
-	hostFunctions  map[int]moejs.Value
-	pending        *pendingOperation
 	pendingOps     map[int]*pendingOperation
 	hostMu         sync.Mutex
-	hostWaiters    map[int]chan payload
+	hostWaiters    map[int]chan *payload
 	syncHostActive atomic.Int32
-	maxSteps       int64
+	budget         realmBudget
 	compileSteps   int64
-	fatal          error
+	compileUntil   time.Time
+	compileMs      float64
+	compileTicks   uint32
+	held           []int
 }
 
 func main() {
-	b := &bridge{modules: make(map[int]*compiledModule), scripts: make(map[int]*bytecode.Function), hostCalls: make(map[int]hostCall), maxSteps: defaultMaxSteps, shutdown: make(chan struct{})}
+	global := js.Global()
+	initLocalZone(global)
+	host = jsCallbacks{global.Get("__moeMessage"), global.Get("__moeNetworkAllow"), global.Get("__moeNetwork")}
+	b := &bridge{modules: make(map[int]*compiledModule), scripts: make(map[int]*bytecode.Function), hostCalls: make(map[int]hostCall), shutdown: make(chan struct{}), idle: make(chan string)}
 	dispatch := js.FuncOf(func(_ js.Value, args []js.Value) any {
 		if len(args) != 1 || args[0].Type() != js.TypeString {
 			return nil
 		}
-		go b.accept(args[0].String())
+		raw := args[0].String()
+		select {
+		case b.idle <- raw:
+		default:
+			go b.serve(raw)
+		}
 		return nil
 	})
+	bindCallback = b.bindCallback
 	js.Global().Set("__moeDispatch", dispatch)
 	<-b.shutdown
 	dispatch.Release()
 }
 
-func (b *bridge) respond(id int, value any, err error) {
-	if err != nil {
-		js.Global().Call("__moeRespond", marshal(map[string]any{"id": id, "ok": false, "error": b.errorPayload(err)}))
-	} else {
-		js.Global().Call("__moeRespond", marshal(map[string]any{"id": id, "ok": true, "value": value}))
+// A sync host callback parks its goroutine, so dispatch starts another when none is idle.
+func (b *bridge) serve(raw string) {
+	for {
+		b.accept(raw)
+		raw = <-b.idle
 	}
+}
+
+func (b *bridge) respond(id int, value any, err error) {
+	if id < 0 {
+		return
+	}
+	buf := strconv.AppendInt(append(make([]byte, 0, 64), `{"type":"response","id":`...), int64(id), 10)
+	if err != nil {
+		buf = appendJSON(append(buf, `,"ok":false,"error":`...), b.errorPayload(err))
+	} else {
+		buf = appendJSON(append(buf, `,"ok":true,"value":`...), value)
+	}
+	b.post(string(append(buf, '}')))
+}
+
+func (b *bridge) post(message string) {
+	if b.held != nil {
+		ids := b.held
+		b.held = nil
+		host.message.Invoke(marshal(map[string]any{"type": "event", "kind": "held", "ids": ids}))
+	}
+	b.releaseMu.Lock()
+	released := b.releasedCallbacks
+	b.releasedCallbacks = nil
+	b.releaseMu.Unlock()
+	if released != nil {
+		host.message.Invoke(marshal(map[string]any{"type": "event", "kind": "released", "ids": released}))
+	}
+	host.message.Invoke(message)
+}
+
+func (b *bridge) postHostCall(id, callbackID int, args []wireValue, this wireValue) {
+	buf := strconv.AppendInt(append(make([]byte, 0, 128), `{"type":"hostCall","id":`...), int64(id), 10)
+	buf = strconv.AppendInt(append(buf, `,"callbackId":`...), int64(callbackID), 10)
+	buf = appendJSON(append(buf, `,"args":`...), args)
+	buf = this.appendJSON(append(buf, `,"thisValue":`...))
+	b.post(string(append(buf, '}')))
 }
 
 func (b *bridge) guard(fn func() error) error       { return b.guardRuntime(fn, true) }
@@ -168,30 +249,29 @@ func (b *bridge) guardRuntime(fn func() error, jobs bool) (err error) {
 	return r.ReleaseJobs(err)
 }
 
-func (b *bridge) dispatch(raw string) {
-	var req request
-	if err := json.Unmarshal([]byte(raw), &req); err != nil {
-		b.respond(0, nil, wireError(err.Error()))
-		return
-	}
+func (b *bridge) dispatch(req *request) {
 	defer func() {
 		if x := recover(); x != nil {
-			err := &moejs.InternalError{Value: x, Stack: debug.Stack()}
-			b.fatal = err
-			b.respond(req.ID, nil, err)
+			b.respond(req.ID, nil, &moejs.InternalError{Value: x, Stack: debug.Stack()})
 		}
 	}()
 	if b.closed.Load() {
 		b.respond(req.ID, nil, wireError("bridge closed"))
 		return
 	}
-	var p payload
-	if err := json.Unmarshal(req.Payload, &p); err != nil {
-		b.respond(req.ID, nil, wireError(err.Error()))
+	if req.payloadErr != nil {
+		b.respond(req.ID, nil, wireError(req.payloadErr.Error()))
 		return
 	}
-	if b.fatal != nil {
-		b.respond(req.ID, nil, b.fatal)
+	p := &req.p
+	b.drainSymbols()
+	// Released handles are applied in order, even while an operation is pending.
+	switch req.Op {
+	case "release":
+		b.releaseHandles(p)
+		return
+	case "debugRetention":
+		b.respond(req.ID, b.retentionStats(), nil)
 		return
 	}
 	if len(b.pendingOps) != 0 && req.Op != "settle" && !p.Reentrant {
@@ -227,25 +307,37 @@ func (b *bridge) dispatch(raw string) {
 			_, _, err := b.dispatchValues(req.Op, p)
 			b.respond(req.ID, nil, err)
 			return
+		case "promiseState":
+			out, err := b.promiseState(p)
+			b.respond(req.ID, out, err)
+			return
+		case "runtimeNewPromise":
+			promise, resolve, reject := b.rt.NewPromise()
+			b.nextRuntimePromise++
+			b.runtimePromises[b.nextRuntimePromise] = runtimePromise{resolve, reject}
+			b.respond(req.ID, map[string]any{"promiseId": b.nextRuntimePromise, "promise": b.retainValue(promise)}, nil)
+			return
 		}
 	}
-	if req.Op != "settle" && !p.Reentrant {
-		b.compileSteps = b.maxSteps
-		if p.MaxSteps != nil && b.rt == nil {
-			b.compileSteps = *p.MaxSteps
-		}
-		if b.rt != nil {
-			setExecutionBudget(b.rt.Realm(), b.maxSteps)
+	// Each request is its own task; one nested in a sync host call shares the caller's budget.
+	if !req.nested {
+		if b.budget != nil {
+			b.budget.RefillExecutionBudget()
+		} else if b.rt == nil {
+			b.compileSteps = compileBudget(p)
+			b.compileUntil, b.compileMs = time.Time{}, p.DeadlineMs
+			if p.DeadlineAt > 0 {
+				b.compileUntil = time.UnixMilli(0).Add(time.Duration(p.DeadlineAt * float64(time.Millisecond)))
+			}
 		}
 	}
 	var result any
 	var value moejs.Value
 	var valueResult bool
 	rawResult := p.Raw
-	var loadPromise *engine.Object
 	runGuard := b.guard
 	switch req.Op {
-	case "load", "call", "has", "runScript":
+	case "load", "call", "has", "runScript", "setGlobal", "rebaseAllocation", "newPromise", "runtimePromiseResolve", "runtimePromiseReject", "valuePure":
 		runGuard = b.guardNative
 	default:
 		if strings.HasPrefix(req.Op, "native") {
@@ -254,8 +346,8 @@ func (b *bridge) dispatch(raw string) {
 	}
 	err := runGuard(func() error {
 		if b.rt != nil {
-			for _, extension := range []func(string, payload) (operationResult, bool, error){b.dispatchNative, b.dispatchValues, b.dispatchControl, b.dispatchNetwork} {
-				out, handled, err := extension(req.Op, p)
+			for _, extension := range [...]func(*bridge, string, *payload) (operationResult, bool, error){(*bridge).dispatchNative, (*bridge).dispatchValues, (*bridge).dispatchControl, (*bridge).dispatchNetwork} {
+				out, handled, err := extension(b, req.Op, p)
 				if handled {
 					result, value, valueResult, rawResult = out.data, out.value, out.hasValue, out.raw
 					return err
@@ -263,18 +355,19 @@ func (b *bridge) dispatch(raw string) {
 			}
 		}
 		switch req.Op {
-		case "compile", "link":
-			var mod *compiledModule
-			var err error
-			if req.Op == "link" {
-				mod, err = b.prepareModule(p)
-			} else {
-				mod, err = b.compile(p)
-			}
+		case "compile":
+			mod, err := b.compile(p)
 			if err != nil {
 				return err
 			}
-			result, err = moduleMetadata(mod)
+			result, err = moduleMetadata(mod, mod.exports, true)
+			return err
+		case "link":
+			mod, linked, err := b.moduleFromPayload(p)
+			if err != nil {
+				return err
+			}
+			result, err = moduleMetadata(mod, linked.Exports(), false)
 			return err
 		case "compileScript", "compileFunction":
 			p.Function = req.Op == "compileFunction"
@@ -292,67 +385,66 @@ func (b *bridge) dispatch(raw string) {
 			if p.MaxSteps != nil {
 				steps = *p.MaxSteps
 			}
-			if steps <= 0 {
-				return wireError("maxSteps must be a positive integer")
-			}
-			if p.MemoryLimit < 0 {
-				return wireError("memoryLimit must not be negative")
-			}
+			// Omitted is Options.TimeZone nil, time.Local; a string is a name time.LoadLocation takes.
 			var zone *time.Location
-			if p.TimeZone != "" {
+			if p.TimeZone != nil {
 				var err error
-				zone, err = time.LoadLocation(p.TimeZone)
-				if err != nil {
+				if zone, err = loadLocation(*p.TimeZone); err != nil {
 					return err
 				}
 			}
-			b.maxSteps = steps
-			b.rt = moejs.NewRuntime(moejs.Options{MemoryLimit: p.MemoryLimit, MutableIntrinsics: p.MutableIntrinsics, DisableDynamicCode: p.DisableDynamicCode, MaxDynamicSource: p.MaxDynamicSource, Locale: p.Locale, TimeZone: zone})
+			// Each runtime is its own Go instance, so these size its collector as GOGC and GOMEMLIMIT would.
+			if p.GCPercent != nil {
+				debug.SetGCPercent(*p.GCPercent)
+			}
+			if p.GoMemoryLimit != nil {
+				if *p.GoMemoryLimit <= 0 {
+					return wireError("goMemoryLimit must be positive")
+				}
+				debug.SetMemoryLimit(*p.GoMemoryLimit)
+			}
+			b.rt = moejs.NewRuntime(moejs.Options{MemoryLimit: p.MemoryLimit, MutableIntrinsics: p.MutableIntrinsics, DisableDynamicCode: p.DisableDynamicCode, MaxDynamicSource: p.MaxDynamicSource, Locale: p.Locale, TimeZone: zone, Importer: b.newImporter(p)})
 			b.pendingOps = make(map[int]*pendingOperation)
 			b.initializeValues()
-			b.installImporter(p)
-			if err := b.initializeLoop(p); err != nil {
-				return err
+			b.initializeControl(p)
+			if p.LoopOptions == nil || !p.LoopOptions.Disabled {
+				if err := b.initializeLoop(p.LoopOptions); err != nil {
+					return err
+				}
+				if p.WebAPI == nil || *p.WebAPI {
+					if err := b.installWebAPI(p); err != nil {
+						return err
+					}
+				}
 			}
-			setExecutionBudget(b.rt.Realm(), steps)
+			b.budget = budgetOf(b.rt.Realm())
+			b.budget.SetExecutionBudget(steps, errExecutionBudget)
+			b.installInterruptPoll()
 			b.rt.AddLiveRoots(func(add func(moejs.Value)) {
 				for _, call := range b.hostCalls {
 					add(call.promise)
-				}
-				for _, fn := range b.hostFunctions {
-					add(fn)
 				}
 				for _, pending := range b.pendingOps {
 					add(pending.promise)
 				}
 			})
-			b.startLoop()
+			if b.loop != nil {
+				b.implicitStart.Store(true)
+				b.startLoop()
+			}
 		default:
 			if b.rt == nil {
 				return wireError("runtime is not initialized")
 			}
 			switch req.Op {
 			case "load":
-				var err error
-				loadPromise, err = b.loadModule(p)
-				return err
+				return b.loadModule(p)
 			case "call":
-				referrer, known := b.moduleByNative[b.rt.Module()]
-				if p.ModuleID != 0 && (!known || referrer.ID != p.ModuleID) {
-					return moejs.ErrHookNotFound
-				}
-				hook, err := b.moduleHook(p.Path)
+				args, err := b.decodeHeld(p.Args)
 				if err != nil {
 					return err
 				}
-				args := make([]moejs.Value, len(p.Args))
-				for i, item := range p.Args {
-					args[i], err = b.decode(item, true, 0)
-					if err != nil {
-						return err
-					}
-				}
-				value, err = b.rt.Call(hook, args...)
+				value, err = b.rt.Call(b.payloadHook(p), args...)
 				valueResult = true
 				return err
 			case "runScript":
@@ -369,11 +461,8 @@ func (b *bridge) dispatch(raw string) {
 				valueResult = true
 				return err
 			case "has":
-				hook, err := b.moduleHook(p.Path)
-				if err != nil {
-					return err
-				}
-				result, err = b.rt.Has(hook)
+				var err error
+				result, err = b.rt.Has(b.payloadHook(p))
 				return err
 			case "export":
 				exported, ok := b.moduleExport(p.Name)
@@ -381,36 +470,24 @@ func (b *bridge) dispatch(raw string) {
 					exported = moejs.Undefined()
 				}
 				result = map[string]any{"value": b.retainValue(exported), "ok": ok}
+			case "installWebAPI":
+				if b.loop == nil {
+					return errors.New("webapi: Install needs a loop")
+				}
+				return b.installWebAPI(p)
 			case "evalScript":
 				var err error
 				value, err = b.rt.Realm().EvalScript(p.Name, p.Source)
 				valueResult = true
 				return err
 			case "setGlobal":
-				value, err := b.decode(p.Value, true, 0)
+				values, err := b.decodeHeld([]wireValue{p.Value})
 				if err != nil {
 					return err
 				}
-				return b.rt.SetGlobal(p.Name, value)
+				return b.rt.SetGlobal(p.Name, values[0])
 			case "settle":
-				call, ok := b.hostCalls[p.CallID]
-				if !ok {
-					return nil
-				}
-				delete(b.hostCalls, p.CallID)
-				if p.Error != nil {
-					err := b.hostError(p.Error)
-					thrown, ok := b.rt.ThrownValue(err)
-					if !ok {
-						return err
-					}
-					return call.reject(thrown)
-				}
-				value, err := b.decode(p.Value, true, 0)
-				if err != nil {
-					return err
-				}
-				return call.resolve(value)
+				return b.settleHostCall(p)
 			default:
 				return wireError("unknown operation: " + req.Op)
 			}
@@ -423,13 +500,6 @@ func (b *bridge) dispatch(raw string) {
 			b.rejectPending(err)
 		}
 		return
-	}
-	if req.Op == "load" {
-		if loadPromise != nil {
-			b.addPending(&pendingOperation{id: req.ID, promise: engine.ObjectValue(loadPromise), load: true})
-			b.poll()
-			return
-		}
 	}
 	if valueResult {
 		if rawResult {
@@ -457,26 +527,15 @@ func (b *bridge) addPending(p *pendingOperation) {
 		b.pendingOps = make(map[int]*pendingOperation)
 	}
 	b.pendingOps[p.id] = p
-	b.pending = p
 }
 
-func (b *bridge) completePending(id int) {
-	delete(b.pendingOps, id)
-	if b.pending != nil && b.pending.id == id {
-		b.pending = nil
-		for _, other := range b.pendingOps {
-			b.pending = other
-			break
-		}
-	}
-}
+func (b *bridge) completePending(id int) { delete(b.pendingOps, id) }
 
 func (b *bridge) rejectPending(err error) {
 	for id := range b.pendingOps {
 		b.respond(id, nil, err)
 		delete(b.pendingOps, id)
 	}
-	b.pending = nil
 }
 
 func (b *bridge) pollOperation(pending *pendingOperation) {
@@ -502,15 +561,10 @@ func (b *bridge) pollOperation(pending *pendingOperation) {
 		}
 		value = result
 	}
-	if pending.load {
-		b.completePending(pending.id)
-		b.respond(pending.id, nil, nil)
-		return
-	}
 	var encoded wireValue
 	err := b.guard(func() error {
 		var err error
-		encoded, err = b.encode(value, make(map[*moejs.Object]bool), 0)
+		encoded, err = b.encode(value)
 		return err
 	})
 	b.completePending(pending.id)
@@ -548,42 +602,76 @@ func (b *bridge) lookup(path []string, own bool) (moejs.Value, error) {
 }
 
 func (b *bridge) stopCompile() error {
-	b.compileSteps--
-	if b.compileSteps < 0 {
+	if b.compileTicks++; b.compileTicks&63 == 0 {
+		if err := b.compileExpired(); err != nil {
+			return err
+		}
+	}
+	switch {
+	case b.compileSteps < 0:
+		return nil
+	case b.compileSteps == 0:
 		return errExecutionBudget
+	}
+	b.compileSteps--
+	return nil
+}
+
+// compileExpired is the compile deadline of CompileOptions.Context, set from the request timeout.
+func (b *bridge) compileExpired() error {
+	if !b.compileUntil.IsZero() && !time.Now().Before(b.compileUntil) {
+		return &timeoutError{b.compileMs}
 	}
 	return nil
 }
 
-func (b *bridge) compile(p payload) (*compiledModule, error) { return b.compilePrepared(p) }
+// decodeHeld decodes host values so a measurement waits until JavaScript can reach them.
+func (b *bridge) decodeHeld(items []wireValue) ([]moejs.Value, error) {
+	defer b.budget.EndHolding(b.budget.BeginHolding())
+	values := make([]moejs.Value, len(items))
+	for i, item := range items {
+		var err error
+		if values[i], err = b.decode(item, true, 0); err != nil {
+			return nil, err
+		}
+	}
+	return values, nil
+}
 
-func (b *bridge) compileScript(p payload) (*bytecode.Function, error) {
+func (b *bridge) compile(p *payload) (*compiledModule, error) { return b.compilePrepared(p) }
+
+func (b *bridge) compileScript(p *payload) (*bytecode.Function, error) {
 	return b.compileScriptPrepared(p)
 }
 
-func (b *bridge) hostFunction(callbackID int, options ...hostFunctionOptions) moejs.Value {
-	if fn, ok := b.hostFunctions[callbackID]; ok {
-		return fn
-	}
-	opts := hostFunctionOptions{Name: fmt.Sprintf("host%d", callbackID), Async: true}
-	if len(options) != 0 {
-		opts = options[0]
-	}
-	fn := b.rt.Function(opts.Name, opts.Length, func(_ *moejs.Realm, this moejs.Value, args []moejs.Value) (moejs.Value, error) {
+// hostFunction makes a new guest function per crossing, as FromGo of a NativeFunc does; it keeps cb alive.
+func (b *bridge) hostFunction(cb *hostCallback, opts hostFunctionOptions) moejs.Value {
+	return b.rt.Function(opts.Name, opts.Length, func(_ *moejs.Realm, this moejs.Value, args []moejs.Value) (moejs.Value, error) {
 		encoded := make([]wireValue, len(args))
-		for i, arg := range args {
+		var thisWire wireValue
+		var temps []int
+		if opts.Raw {
+			// NativeFunc arguments are live Values that do not outlive the call.
+			for i, arg := range args {
+				encoded[i] = b.retainArgument(arg, &temps)
+			}
+			thisWire = b.retainArgument(this, &temps)
+		} else {
+			for i, arg := range args {
+				var err error
+				encoded[i], err = b.encode(arg)
+				if err != nil {
+					return moejs.Undefined(), err
+				}
+			}
 			var err error
-			encoded[i], err = b.encode(arg, make(map[*moejs.Object]bool), 0)
-			if err != nil {
+			if thisWire, err = b.encode(this); err != nil {
 				return moejs.Undefined(), err
 			}
 		}
-		thisWire, err := b.encode(this, make(map[*moejs.Object]bool), 0)
-		if err != nil {
-			return moejs.Undefined(), err
-		}
 		if !opts.Async {
-			reply, err := b.callHost(callbackID, encoded, thisWire)
+			reply, err := b.callHost(cb.id, encoded, thisWire)
+			defer b.releaseTemporaries(temps)
 			if err != nil {
 				return moejs.Undefined(), err
 			}
@@ -592,44 +680,66 @@ func (b *bridge) hostFunction(callbackID int, options ...hostFunctionOptions) mo
 		b.nextHostCall++
 		id := b.nextHostCall
 		promise, resolve, reject := b.rt.NewPromise()
-		b.hostCalls[id] = hostCall{promise: promise, resolve: resolve, reject: reject}
-		js.Global().Call("__moeHostCall", marshal(map[string]any{"id": id, "callbackId": callbackID, "args": encoded, "thisValue": thisWire}))
+		call := hostCall{promise: promise, resolve: resolve, reject: reject, temps: temps}
+		// Upstream's async host results come from Loop.NewPromise, which holds the loop.
+		if b.loop != nil {
+			call.release = b.loop.Hold()
+		}
+		b.hostCalls[id] = call
+		b.postHostCall(id, cb.id, encoded, thisWire)
 		return promise, nil
 	})
-	if b.hostFunctions == nil {
-		b.hostFunctions = make(map[int]moejs.Value)
-	}
-	b.hostFunctions[callbackID] = fn
-	return fn
 }
 
+// hostError is the Go error a host throw stands for; the engine turns a plain one into an Error.
 func (b *bridge) hostError(p *errorPayload) error {
-	switch p.Kind {
-	case "interrupted", "budget", "memory", "timeout", "internal":
-		return b.payloadNativeError(p)
+	if p == nil {
+		return b.payloadNativeError(nil)
 	}
-	if p.Value != nil {
-		value, err := b.decode(*p.Value, true, 0)
-		if err != nil {
-			return err
-		}
-		return b.rt.Realm().Throw(value)
-	}
-	value, _ := b.rt.ThrownValue(&hostPayloadError{*p})
-	if value.IsObject() && p.Name != "" {
-		r := b.rt.Realm()
-		if err := value.AsObject().CreateDataPropertyOrThrow(r, r.KeyFromGoString("name"), moejs.String(p.Name)); err != nil {
-			return err
-		}
-	}
-	return b.rt.Realm().Throw(value)
+	pinned := b.pinPayload(*p)
+	return b.payloadNativeError(&pinned)
 }
 
-func (b *bridge) acceptHostSettlement(raw json.RawMessage) bool {
-	var p payload
-	if json.Unmarshal(raw, &p) != nil {
-		return false
+// settleHostCall is pending.run of upstream NewPromise: a host error rejects with its thrown value.
+func (b *bridge) settleHostCall(p *payload) error {
+	call, ok := b.hostCalls[p.CallID]
+	if !ok {
+		return nil
 	}
+	delete(b.hostCalls, p.CallID)
+	defer b.releaseTemporaries(call.temps)
+	if call.release != nil {
+		defer call.release(nil)
+	}
+	var value moejs.Value
+	var err error
+	if p.Error != nil {
+		err = b.hostError(p.Error)
+	} else {
+		value, err = b.decode(p.Value, true, 0)
+	}
+	if err != nil {
+		reason, ok := b.rt.ThrownValue(err)
+		if !ok {
+			return err
+		}
+		return call.reject(reason)
+	}
+	return call.resolve(value)
+}
+
+// releaseHostCallHolds lets the loop go idle once the host can no longer answer outstanding calls.
+func (b *bridge) releaseHostCallHolds() {
+	for id, call := range b.hostCalls {
+		if call.release != nil {
+			call.release(nil)
+			call.release = nil
+			b.hostCalls[id] = call
+		}
+	}
+}
+
+func (b *bridge) acceptHostSettlement(p *payload) bool {
 	b.hostMu.Lock()
 	ch := b.hostWaiters[p.CallID]
 	delete(b.hostWaiters, p.CallID)
@@ -641,29 +751,26 @@ func (b *bridge) acceptHostSettlement(raw json.RawMessage) bool {
 	return true
 }
 
-func (b *bridge) closeHostCalls() {
+func (b *bridge) closeHostCalls(e errorPayload) {
 	b.hostMu.Lock()
 	defer b.hostMu.Unlock()
 	for id, ch := range b.hostWaiters {
-		ch <- payload{Error: &errorPayload{Kind: "closed", Name: "Error", Message: "MoeJS runtime is closed"}}
+		ch <- &payload{Error: &e}
 		delete(b.hostWaiters, id)
 	}
 }
 
-func (b *bridge) acceptNested(raw string, req request) bool {
-	if b.syncHostActive.Load() == 0 {
-		return false
-	}
-	var p payload
-	if json.Unmarshal(req.Payload, &p) != nil || !p.Reentrant {
+func (b *bridge) acceptNested(req *request) bool {
+	if b.syncHostActive.Load() == 0 || req.payloadErr != nil || !req.p.Reentrant {
 		return false
 	}
 	switch req.Op {
-	case "close", "moduleResult", "settle", "interrupt", "clearInterrupt", "loopStart", "loopRun", "loopStop", "loopStopNoWait", "loopTerminate":
+	case "close", "moduleResult", "settle", "interrupt", "loopNew", "loopStart", "loopRun", "loopStop", "loopStopNoWait", "loopTerminate":
 		return false
-	case "loopHold", "loopRelease", "loopPost", "loopRunOnLoop", "promiseResolve", "promiseReject", "networkClose", "networkSetContext", "networkCancelContext", "networkCancelParent":
-		return b.acceptControl(req)
 	}
-	b.dispatch(raw)
+	if !b.deferNested(req) {
+		b.dispatchNested(req)
+		b.replayDeferred()
+	}
 	return true
 }

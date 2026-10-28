@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -20,9 +21,15 @@ import (
 )
 
 type nativeState struct {
-	natives           map[int]reflect.Value
-	nextNativeID      int
-	removeNativeRoots func()
+	natives        map[int]reflect.Value
+	nativePointers map[nativePointer]int
+	nextNativeID   int
+	nativeSent     map[int]int
+}
+
+type nativePointer struct {
+	target  reflect.Type
+	pointer uintptr
 }
 type nativePayload struct {
 	Native       wireValue       `json:"native"`
@@ -47,6 +54,8 @@ type nativeConversion struct {
 	values      map[nativeConversionKey]reflect.Value
 	definitions map[int]wireValue
 	guest       map[int]moejs.Value
+	// fromGo builds the Go values rt.fromGo hands to upstream FromGo.
+	fromGo bool
 }
 
 func (b *bridge) nativeConversion(w wireValue) (*nativeConversion, wireValue, error) {
@@ -63,10 +72,6 @@ func (b *bridge) nativeConversion(w wireValue) (*nativeConversion, wireValue, er
 				c.definitions[value.ID] = value
 			}
 			visit(value.V)
-		case map[string]any:
-			if item, e := readWire(value); e == nil {
-				visit(item)
-			}
 		case []any:
 			for _, item := range value {
 				visit(item)
@@ -105,12 +110,27 @@ func (b *bridge) nativeValue(id int) (reflect.Value, error) {
 	return v, nil
 }
 func (b *bridge) releaseNatives() {
-	if b.removeNativeRoots != nil {
-		b.removeNativeRoots()
-		b.removeNativeRoots = nil
-	}
+	clear(b.nativeSent)
 	clear(b.natives)
 	b.natives = nil
+	clear(b.nativePointers)
+}
+
+func (b *bridge) forgetNative(id int) {
+	if v, ok := b.natives[id]; ok && v.Kind() == reflect.Pointer {
+		delete(b.nativePointers, nativePointer{v.Type(), v.Pointer()})
+	}
+	delete(b.natives, id)
+	delete(b.nativeSent, id)
+}
+
+// unretainNative releases count posted occurrences of a native handle; count <= 0 releases them all.
+func (b *bridge) unretainNative(id, count int) {
+	if n := b.nativeSent[id]; count > 0 && n > count {
+		b.nativeSent[id] = n - count
+		return
+	}
+	b.forgetNative(id)
 }
 func (b *bridge) encodeNative(v reflect.Value) (wireValue, error) {
 	w, err := b.encodeNativeGraph(v, &nativeEncoding{seen: make(map[nativeSliceIdentity]int)})
@@ -213,12 +233,7 @@ func (b *bridge) encodeNativeGraph(v reflect.Value, state *nativeEncoding) (wire
 	}
 	if b.natives == nil {
 		b.natives = make(map[int]reflect.Value)
-		b.removeNativeRoots = b.rt.AddLiveRoots(func(add func(moejs.Value)) {
-			seen := make(map[uintptr]bool)
-			for _, value := range b.natives {
-				b.nativeRoots(value, add, seen)
-			}
-		})
+		b.nativeSent = make(map[int]int)
 	}
 	name := ""
 	if referrer, ok := v.Interface().(moejs.Referrer); ok {
@@ -226,14 +241,20 @@ func (b *bridge) encodeNativeGraph(v reflect.Value, state *nativeEncoding) (wire
 	}
 	// Pointer identity is stable; functions deliberately do not share code-pointer identities.
 	if v.Kind() == reflect.Pointer {
-		for id, old := range b.natives {
-			if old.Type() == v.Type() && old.Kind() == reflect.Pointer && old.Pointer() == v.Pointer() {
-				return wireValue{T: "native", ID: id, Kind: v.Type().String(), Name: name}, nil
-			}
+		if id, ok := b.nativePointers[nativePointer{v.Type(), v.Pointer()}]; ok {
+			b.nativeSent[id]++
+			return wireValue{T: "native", ID: id, Kind: v.Type().String(), Name: name}, nil
 		}
 	}
 	b.nextNativeID++
 	b.natives[b.nextNativeID] = v
+	b.nativeSent[b.nextNativeID] = 1
+	if v.Kind() == reflect.Pointer {
+		if b.nativePointers == nil {
+			b.nativePointers = make(map[nativePointer]int)
+		}
+		b.nativePointers[nativePointer{v.Type(), v.Pointer()}] = b.nextNativeID
+	}
 	return wireValue{T: "native", ID: b.nextNativeID, Kind: v.Type().String(), Name: name}, nil
 }
 func (b *bridge) nativeDecodeTarget(w wireValue) (any, error) {
@@ -370,9 +391,29 @@ func (c *nativeConversion) convert(w wireValue, t reflect.Type, depth int) (refl
 			return reflect.ValueOf(gv), e
 		}
 		if gv, e := b.nativeAsValue(v); e == nil {
-			return c.convert(b.retainValue(gv), t, depth+1)
+			return c.convert(wireValue{T: "guest", V: gv}, t, depth+1)
 		}
 		return fail("handle has type " + v.Type().String())
+	}
+	if c.fromGo && t.Kind() == reflect.Interface && t.NumMethod() == 0 {
+		switch w.T {
+		case "undefined":
+			return reflect.ValueOf(moejs.Undefined()), nil
+		case "rawjson":
+			text, _ := w.V.(string)
+			return reflect.ValueOf(json.RawMessage(text)), nil
+		case "buffer", "view":
+			gv, e := c.decode(w)
+			if e != nil {
+				return reflect.Value{}, e
+			}
+			data, _ := gv.AsObject().BufferData()
+			return reflect.ValueOf(append([]byte{}, data...)), nil
+		case "ref", "function", "symbol", "string16", "map", "set", "regexp", "error":
+			// FromGo takes Values as they are; Go has no type for these.
+			gv, e := c.decode(w)
+			return reflect.ValueOf(gv), e
+		}
 	}
 	if w.T == "null" || w.T == "undefined" || w.T == "" {
 		switch t.Kind() {
@@ -438,6 +479,10 @@ func (c *nativeConversion) convert(w wireValue, t reflect.Type, depth int) (refl
 			return fail("expected a byte buffer or view")
 		}
 		out := reflect.MakeSlice(t, len(bytes), len(bytes))
+		if t.Elem() == reflect.TypeFor[byte]() {
+			reflect.Copy(out, reflect.ValueOf(bytes))
+			return out, nil
+		}
 		for i, byteValue := range bytes {
 			out.Index(i).SetUint(uint64(byteValue))
 		}
@@ -469,7 +514,11 @@ func (c *nativeConversion) convert(w wireValue, t reflect.Type, depth int) (refl
 		if w.ID <= 0 {
 			return fail("invalid host callback")
 		}
-		return b.nativeCallback(w.ID, t), nil
+		cb, ok := w.V.(*hostCallback)
+		if !ok {
+			return fail("invalid host callback")
+		}
+		return b.nativeCallback(cb, t), nil
 	}
 	if t.Kind() == reflect.Interface {
 		if t == reflect.TypeOf((*engine.Compiler)(nil)).Elem() {
@@ -506,7 +555,8 @@ func (c *nativeConversion) convert(w wireValue, t reflect.Type, depth int) (refl
 				value, exists := b.natives[report.ID]
 				callable = exists && value.Kind() == reflect.Func
 			}
-			if callable {
+			// Under FromGo the object stays a plain map: FromGo has no field for the adapter.
+			if callable && !c.fromGo {
 				ft := reflect.TypeOf((func(func(moejs.Value), func(int)))(nil))
 				fn, e := c.convert(report, ft, depth+1)
 				if e != nil {
@@ -657,13 +707,13 @@ func (c *nativeConversion) convert(w wireValue, t reflect.Type, depth int) (refl
 	case reflect.Slice, reflect.Array:
 		if w.T == "buffer" {
 			w.T = "array"
-			items, ok := w.V.([]any)
-			if !ok {
+			data, e := wireBytes(w)
+			if e != nil {
 				return fail("invalid byte buffer")
 			}
-			converted := make([]wireValue, len(items))
-			for i, x := range items {
-				converted[i] = wireValue{T: "number", V: x}
+			converted := make([]wireValue, len(data))
+			for i, x := range data {
+				converted[i] = wireValue{T: "number", V: float64(x)}
 			}
 			w.V = converted
 		}
@@ -875,7 +925,9 @@ func (b *bridge) nativeAsValue(v reflect.Value) (moejs.Value, error) {
 	}
 	return moejs.Undefined(), wireError("native handle is not an engine Value/Object/String/Symbol/BigInt")
 }
-func (b *bridge) nativeCallback(id int, t reflect.Type) reflect.Value {
+
+// nativeCallback keeps cb alive as long as the Go func value lives.
+func (b *bridge) nativeCallback(cb *hostCallback, t reflect.Type) reflect.Value {
 	return reflect.MakeFunc(t, func(args []reflect.Value) []reflect.Value {
 		out := make([]reflect.Value, t.NumOut())
 		for i := range out {
@@ -886,7 +938,7 @@ func (b *bridge) nativeCallback(id int, t reflect.Type) reflect.Value {
 		ephemeral := make([]int, 0)
 		defer func() {
 			for _, id := range ephemeral {
-				delete(b.natives, id)
+				b.forgetNative(id)
 			}
 		}()
 		for i, arg := range args {
@@ -901,7 +953,7 @@ func (b *bridge) nativeCallback(id int, t reflect.Type) reflect.Value {
 		}
 		var result wireValue
 		if err == nil {
-			result, err = b.callHost(id, encoded, wireValue{T: "undefined"})
+			result, err = b.callHost(cb.id, encoded, wireValue{T: "undefined"})
 		}
 		count := len(out)
 		hasError := count > 0 && t.Out(count-1) == nativeErrorType
@@ -935,6 +987,11 @@ func (b *bridge) nativeCallback(id int, t reflect.Type) reflect.Value {
 					out[i] = reflect.Zero(t.Out(i))
 				}
 				out[len(out)-1] = reflect.ValueOf(err)
+			} else if interrupted := (*moejs.InterruptedError)(nil); errors.As(err, &interrupted) {
+				// The realm's pending interrupt stops the Go caller at its next check, as a roots walk's tick does.
+				for i := range out {
+					out[i] = reflect.Zero(t.Out(i))
+				}
 			} else {
 				panic(err)
 			}
@@ -942,6 +999,27 @@ func (b *bridge) nativeCallback(id int, t reflect.Type) reflect.Value {
 		return out
 	})
 }
+
+// nativeArguments converts like decodeHeld, so a measurement waits until the call can reach them.
+func (b *bridge) nativeArguments(conversion *nativeConversion, args []wireValue, t reflect.Type, minimum int) ([]reflect.Value, error) {
+	defer b.budget.EndHolding(b.budget.BeginHolding())
+	in := make([]reflect.Value, len(args))
+	for i, w := range args {
+		var target reflect.Type
+		if t.IsVariadic() && i >= minimum {
+			target = t.In(t.NumIn() - 1).Elem()
+		} else {
+			target = t.In(i)
+		}
+		v, e := conversion.convert(w, target, 0)
+		if e != nil {
+			return nil, fmt.Errorf("argument %d: %w", i, e)
+		}
+		in[i] = v
+	}
+	return in, nil
+}
+
 func (b *bridge) nativeInvoke(fn reflect.Value, arguments wireValue) (wireValue, error) {
 	if !fn.IsValid() || fn.Kind() != reflect.Func || fn.IsNil() {
 		return wireValue{}, wireError("native member is not callable")
@@ -962,19 +1040,9 @@ func (b *bridge) nativeInvoke(fn reflect.Value, arguments wireValue) (wireValue,
 	if len(args) < minimum || (!t.IsVariadic() && len(args) != minimum) {
 		return wireValue{}, wireError(fmt.Sprintf("native call expects %d arguments (variadic=%t), received %d", minimum, t.IsVariadic(), len(args)))
 	}
-	in := make([]reflect.Value, len(args))
-	for i, w := range args {
-		var target reflect.Type
-		if t.IsVariadic() && i >= minimum {
-			target = t.In(t.NumIn() - 1).Elem()
-		} else {
-			target = t.In(i)
-		}
-		v, e := conversion.convert(w, target, 0)
-		if e != nil {
-			return wireValue{}, fmt.Errorf("argument %d: %w", i, e)
-		}
-		in[i] = v
+	in, err := b.nativeArguments(conversion, args, t, minimum)
+	if err != nil {
+		return wireValue{}, err
 	}
 	out := fn.Call(in)
 	if len(out) > 0 && t.Out(t.NumOut()-1) == nativeErrorType {
@@ -1149,85 +1217,6 @@ func nativeSchemaType(raw json.RawMessage, depth int) (reflect.Type, error) {
 	}
 	return nil, wireError("invalid native type schema")
 }
-func (b *bridge) nativeRoots(v reflect.Value, add func(moejs.Value), seen map[uintptr]bool) {
-	if !v.IsValid() || !v.CanInterface() {
-		return
-	}
-	if v.Kind() == reflect.Interface {
-		if !v.IsNil() {
-			b.nativeRoots(v.Elem(), add, seen)
-		}
-		return
-	}
-	if v.Type() == reflect.TypeOf(b.rt) || v.Type() == reflect.TypeOf(b.rt.Realm()) {
-		return
-	}
-	if value, e := b.nativeAsValue(v); e == nil {
-		add(value)
-		return
-	}
-	if key, ok := v.Interface().(engine.PropertyKey); ok {
-		add(key.Value())
-		return
-	}
-	if key, ok := v.Interface().(*engine.PropertyKey); ok && key != nil {
-		add(key.Value())
-		return
-	}
-	switch v.Kind() {
-	case reflect.Pointer:
-		if v.IsNil() || seen[v.Pointer()] {
-			return
-		}
-		seen[v.Pointer()] = true
-		switch value := v.Interface().(type) {
-		case *engine.Env:
-			for _, slot := range value.Slots() {
-				add(slot)
-			}
-			b.nativeRoots(reflect.ValueOf(value.Parent()), add, seen)
-		case *engine.FunctionData:
-			b.nativeRoots(reflect.ValueOf(value.Env()), add, seen)
-			add(value.ThisValue())
-			if home := value.HomeObject(); home != nil {
-				add(engine.ObjectValue(home))
-			}
-			b.nativeRoots(reflect.ValueOf(value.Data()), add, seen)
-		default:
-			b.nativeRoots(v.Elem(), add, seen)
-		}
-	case reflect.Struct:
-		for i := range v.NumField() {
-			if v.Type().Field(i).PkgPath == "" {
-				b.nativeRoots(v.Field(i), add, seen)
-			}
-		}
-	case reflect.Slice, reflect.Array:
-		if v.Kind() == reflect.Slice {
-			if v.IsNil() || seen[v.Pointer()] {
-				return
-			}
-			seen[v.Pointer()] = true
-		}
-		for i := range v.Len() {
-			b.nativeRoots(v.Index(i), add, seen)
-		}
-	case reflect.Map:
-		if v.IsNil() {
-			return
-		}
-		pointer := uintptr(v.UnsafePointer())
-		if seen[pointer] {
-			return
-		}
-		seen[pointer] = true
-		iter := v.MapRange()
-		for iter.Next() {
-			b.nativeRoots(iter.Key(), add, seen)
-			b.nativeRoots(iter.Value(), add, seen)
-		}
-	}
-}
 func (b *bridge) nativeSnapshot(v reflect.Value, seen map[uintptr]bool, depth int) (wireValue, error) {
 	if depth > 10000 {
 		return wireValue{}, wireError("native snapshot nesting exceeds 10000")
@@ -1242,17 +1231,10 @@ func (b *bridge) nativeSnapshot(v reflect.Value, seen map[uintptr]bool, depth in
 		return b.nativeSnapshot(v.Elem(), seen, depth+1)
 	}
 	if value, e := b.nativeAsValue(v); e == nil {
-		if depth == 0 {
-			return b.encode(value, nil, 0)
-		}
-		if value.IsObject() || value.Type() == engine.TypeSymbol {
+		if depth != 0 && (value.IsObject() || value.Type() == engine.TypeSymbol) {
 			return b.retainValue(value), nil
 		}
-		encoded, e := b.encode(value, nil, 0)
-		if e != nil {
-			return wireValue{}, e
-		}
-		return b.expandWire(encoded)
+		return b.encode(value)
 	}
 	if v.Type() == reflect.TypeOf(time.Time{}) {
 		return wireValue{T: "date", V: wireValue{T: "number", V: float64(v.Interface().(time.Time).UnixMilli())}}, nil
@@ -1349,28 +1331,16 @@ func nativePackageFunctions(namespace string) map[string]any {
 		values = nativeRegistry_engine()
 		values["Compiler"] = compiler.Hook{}
 	}
-	values["LoadLocation"] = time.LoadLocation
+	values["LoadLocation"] = loadLocation
+	values["FixedZone"] = time.FixedZone
 	values["UnixMilli"] = time.UnixMilli
 	return values
 }
-func (b *bridge) dispatchNative(op string, p payload) (result operationResult, handled bool, err error) {
+func (b *bridge) dispatchNative(op string, p *payload) (result operationResult, handled bool, err error) {
 	if !strings.HasPrefix(op, "native") {
 		return operationResult{}, false, nil
 	}
 	handled = true
-	// Engine escape-hatch methods have preconditions. A mistaken call must not kill the worker.
-	state := b.rt.Realm().CallState()
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			b.rt.Realm().RestoreCallState(state)
-			if failure, ok := recovered.(error); ok {
-				err = failure
-			} else {
-				err = wireError(fmt.Sprintf("native call: %v", recovered))
-			}
-			result = operationResult{}
-		}
-	}()
 	var w wireValue
 	switch op {
 	case "nativeRoot":
@@ -1404,7 +1374,7 @@ func (b *bridge) dispatchNative(op string, p payload) (result operationResult, h
 		if p.Native.T != "native" {
 			return operationResult{}, true, wireError("native operation requires a native handle")
 		}
-		delete(b.natives, p.Native.ID)
+		b.unretainNative(p.Native.ID, p.Count)
 		w = wireValue{T: "undefined"}
 	default:
 		if p.Native.T != "native" {
