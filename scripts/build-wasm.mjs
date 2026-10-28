@@ -12,8 +12,7 @@ const output = join(root, "lib")
 const temporary = await mkdtemp(join(tmpdir(), "moejs-wasm-"))
 const replacements = {}
 
-// Keep upstream checkout pristine. Go's overlay supplies the small deterministic
-// execution budget needed on platforms whose clocks freeze during synchronous JS.
+// Keep upstream checkout pristine; the overlay adds the per-task execution budget and the host interrupt poll.
 async function overlay(relative, transform) {
   const original = join(root, "external", "moejs", relative)
   const target = join(temporary, relative.replaceAll("/", "_"))
@@ -29,27 +28,39 @@ function replaceOnce(source, anchor, replacement) {
   }
   return source.replace(anchor, replacement)
 }
+function replaceEach(source, anchor, replacement, count) {
+  if (source.split(anchor).length - 1 !== count)
+    throw new Error(`Expected ${count} upstream overlay anchors: ${anchor}`)
+  return source.replaceAll(anchor, replacement)
+}
 
 try {
   await mkdir(output, { recursive: true })
   await generateNativeRegistry(root)
-  await overlay(
-    "module.go",
-    (source) =>
+  await overlay("module.go", (source) => {
+    // Decode the early-exports variant only when Link needs it.
+    source = replaceOnce(
+      source,
+      "\tts   bool // CompileTS compiled it\n}",
+      "\tts   bool // CompileTS compiled it\n\tloadEarly func() (*bytecode.Function, error)\n}"
+    )
+    source = replaceOnce(
+      source,
+      "\tif code := m.early.Load(); code != nil {\n\t\treturn code, nil\n\t}\n",
+      "\tif code := m.early.Load(); code != nil {\n\t\treturn code, nil\n\t}\n" +
+        "\tif m.loadEarly != nil {\n\t\tcode, err := m.loadEarly()\n\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n" +
+        "\t\tif !m.early.CompareAndSwap(nil, code) {\n\t\t\tcode = m.early.Load()\n\t\t}\n\t\treturn code, nil\n\t}\n"
+    )
+    return (
       source +
       `
 // ModuleFromBytecode is the WASM bridge's verified-artifact entry point.
-func (*Module) MoeJSModuleFromBytecode(code, early *bytecode.Function, ts bool) *Module {
-    m := &Module{code: code, ts: ts}
-    m.early.Store(early)
-    return m
-}
-func (m *Module) LinkedGraph() *engine.ModuleGraph {
-    if m.graph == nil { return nil }
-    return m.graph.g
+func (*Module) MoeJSModuleFromBytecode(code *bytecode.Function, early func() (*bytecode.Function, error), ts bool) *Module {
+    return &Module{code: code, ts: ts, loadEarly: early}
 }
 `
-  )
+    )
+  })
   await overlay(
     "script.go",
     (source) =>
@@ -60,70 +71,116 @@ func (*Script) MoeJSScriptFromBytecode(code *bytecode.Function) *Script {
 }
 `
   )
-  await overlay("runtime.go", (source) => {
-    source = replaceOnce(
-      source,
-      "type Runtime struct {",
-      "type Runtime struct {\n\tmoduleEvaluationPromise *engine.Object"
-    )
-    source = replaceOnce(
-      source,
-      "rt.env, p, err = r.EvaluateModuleAsync(m.code)",
-      "rt.env, p, err = r.EvaluateModuleAsync(m.code)\n\trt.moduleEvaluationPromise = p"
-    )
-    source = replaceOnce(
-      source,
-      "rt.env, p, err = r.EvaluateGraph(g)",
-      "rt.env, p, err = r.EvaluateGraph(g)\n\trt.moduleEvaluationPromise = p"
-    )
-    return (
-      source +
-      `
-func (rt *Runtime) ModuleEvaluationPromise() *engine.Object { return rt.moduleEvaluationPromise }
-func (rt *Runtime) SetImporter(imp *Importer) {
-    if imp == nil { rt.realm.SetImportHooks(nil); return }
-    rt.realm.SetImportHooks(imp.engineHooks())
-}
-`
-    )
-  })
   await overlay("engine/realm.go", (source) =>
     replaceOnce(
       source,
       "type Realm struct {",
-      "type Realm struct {\n\texecutionBudget int64\n\texecutionBudgetError error"
+      "type Realm struct {\n\texecutionBudget int64\n\texecutionSlice int64\n\texecutionBudgetError error\n\texecutionSteps int64\n\texecutionLimited bool\n\thostInterruptPoll func()\n\tnativePolls uint32"
     )
   )
   await overlay("engine/interrupt.go", (source) => {
     source = replaceOnce(
       source,
       "func (r *Realm) CheckInterrupt() error {",
-      "func (r *Realm) CheckInterrupt() error {\n\tif err := r.checkExecutionBudget(); err != nil { return err }"
+      "func (r *Realm) CheckInterrupt() error {\n\tif err := r.nativeCheckpoint(); err != nil { return err }"
     )
     return (
       source +
       `
-// SetExecutionBudget bounds VM dispatches and native interrupt checkpoints.
-// The bridge resets this only for a new external operation, never host settlement.
+// executionSliceSteps is how many steps run between two polls of the host's interrupt word.
+const executionSliceSteps = 1024
+
+// nativePollEvery is how many native CheckInterrupts share one poll: each costs a call out to the host.
+const nativePollEvery = 16
+
+// SetExecutionBudget sets the steps each task may run; steps <= 0 means no limit.
 func (r *Realm) SetExecutionBudget(steps int64, exhausted error) {
-    r.executionBudget = steps
+    r.executionSteps = max(steps, 0)
     r.executionBudgetError = exhausted
+    r.RefillExecutionBudget()
 }
 
+// RefillExecutionBudget starts a task's budget where eventloop's ResetMemoryPerTask resets memory.
+func (r *Realm) RefillExecutionBudget() {
+    r.executionLimited = r.executionSteps > 0
+    r.executionBudget = max(r.executionSteps-1, 0)
+    r.executionSlice = 0
+    // The first slice is charged here, so a short task never polls the host.
+    if !r.executionLimited {
+        r.executionSlice = executionSliceSteps
+    } else if r.executionBudget > 0 {
+        n := min(executionSliceSteps, r.executionBudget)
+        r.executionBudget -= n
+        r.executionSlice = n
+    }
+}
+
+// SetHostInterruptPoll installs a poll that lets a host interrupt reach the realm while it runs.
+func (r *Realm) SetHostInterruptPoll(poll func()) { r.hostInterruptPoll = poll }
+
+// BeginHolding makes measurements wait while the host decodes values only Go holds, as JSON.parse does.
+func (r *Realm) BeginHolding() bool { return r.holdingBegin() }
+
+func (r *Realm) EndHolding(began bool) { r.holdingEnd(began) }
+
+// checkExecutionBudget stays inlinable: a step only decrements the slice.
 func (r *Realm) checkExecutionBudget() error {
-    if r.interruptFlag.Load() < 0 { return r.interruptError() }
-    if r.executionBudget == 0 { return nil } // intrinsic initialization
-    r.executionBudget--
+    if r.executionSlice > 0 {
+        r.executionSlice--
+        return nil
+    }
+    return r.executionCheckpoint()
+}
+
+// executionCheckpoint ends a slice; a pending interrupt is left to upstream's own checks.
+//
+//go:noinline
+func (r *Realm) executionCheckpoint() error {
+    if r.hostInterruptPoll != nil { r.hostInterruptPoll() }
+    if !r.executionLimited || r.interruptFlag.Load() < 0 {
+        r.executionSlice = executionSliceSteps - 1
+        return nil
+    }
     if r.executionBudget <= 0 {
-        r.executionBudget = -1
         r.Interrupt(r.executionBudgetError)
         return r.interruptError()
     }
+    n := min(executionSliceSteps, r.executionBudget)
+    r.executionBudget -= n
+    r.executionSlice = n - 1
+    return nil
+}
+
+//go:noinline
+func (r *Realm) nativeCheckpoint() error {
+    if r.nativePolls++; r.nativePolls%nativePollEvery == 0 && r.hostInterruptPoll != nil { r.hostInterruptPoll() }
+    return r.checkExecutionBudget()
+}
+
+// jobCheckpoint is CheckInterrupt for each job, without a host poll per job.
+func (r *Realm) jobCheckpoint() error {
+    if err := r.checkExecutionBudget(); err != nil { return err }
+    if r.interruptFlag.Load() < 0 { return r.interruptError() }
     return nil
 }
 `
     )
   })
+  await overlay("engine/jobs.go", (source) =>
+    replaceOnce(
+      source,
+      "\t\tif ierr := r.CheckInterrupt(); ierr != nil {\n\t\t\tr.dropJobs(nil, ierr)",
+      "\t\tif ierr := r.jobCheckpoint(); ierr != nil {\n\t\t\tr.dropJobs(nil, ierr)"
+    )
+  )
+  // A heap walk polls the host too, so an interrupt made while it measures ends it.
+  await overlay("engine/memlive.go", (source) =>
+    replaceOnce(
+      source,
+      "\tif w.work++; w.work%liveCheckEvery == 0 && w.r.interruptValue.Load() != w.start {\n\t\tw.stopped = true\n\t}\n}",
+      "\tif w.work++; w.work%liveCheckEvery == 0 {\n\t\tw.checkpoint()\n\t}\n}\n\n//go:noinline\nfunc (w *liveWalker) checkpoint() {\n\tif w.r.hostInterruptPoll != nil {\n\t\tw.r.hostInterruptPoll()\n\t}\n\tif w.r.interruptValue.Load() != w.start {\n\t\tw.stopped = true\n\t}\n}"
+    )
+  )
   for (const file of ["engine/interp_run.go", "engine/interp_run_regcheck.go"]) {
     await overlay(file, (source) =>
       replaceOnce(
@@ -154,6 +211,37 @@ func (notify hostPromiseObserver) promiseSettled(_ *Realm, _ Value, _ bool) erro
 }
 `
   )
+  await overlay("eventloop/eventloop.go", (source) => {
+    // The loop's own interrupt checks must not spend the steps of JavaScript.
+    source = replaceEach(
+      source,
+      "\t\tl.err = l.rt.Realm().CheckInterrupt()\n",
+      "\t\tl.err = l.interruptPending()\n",
+      2
+    )
+    source = replaceOnce(
+      source,
+      "func (l *Loop) call(fn, this moejs.Value, args []moejs.Value) error {\n\t_, err := l.rt.CallFunction(fn, this, args...)\n",
+      "func (l *Loop) call(fn, this moejs.Value, args []moejs.Value) error {\n\tl.rt.Realm().RefillExecutionBudget()\n\t_, err := l.rt.CallFunction(fn, this, args...)\n"
+    )
+    source = replaceOnce(
+      source,
+      "\t\tif l.fail(task(l.rt)) {\n",
+      "\t\tl.rt.Realm().RefillExecutionBudget()\n\t\tif l.fail(task(l.rt)) {\n"
+    )
+    return (
+      source +
+      `
+// interruptPending is CheckInterrupt without the step the overlay charges there.
+func (l *Loop) interruptPending() error {
+    if r := l.rt.Realm(); r.Interrupted() {
+        return r.CheckInterrupt()
+    }
+    return nil
+}
+`
+    )
+  })
   const overlayFile = join(temporary, "overlay.json")
   await writeFile(overlayFile, JSON.stringify({ Replace: replacements }))
   execFileSync(

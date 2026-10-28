@@ -25,6 +25,7 @@ async function setup() {
     export function symbolFacts(a, b, global, known, object) { return [a === b, global === Symbol.for('shared'), known === Symbol.iterator, object[a]] }
     export function sharedIncrement(buffer) { const view = new Int32Array(buffer); Atomics.add(view, 0, 2); return { buffer, view } }
     export function deep(n) { let value = { end: true }; while (n--) value = { next: value }; return value }
+    export function sameView() { const view = new Uint8Array([1, 2]); return [view, view] }
   `
   )
   const runtime = await engine.newRuntime()
@@ -171,6 +172,9 @@ describe("native WASM value bridge", () => {
     expect(output.emptyView.buffer).toBe(output.buffer)
     const wide = new BigInt64Array([1n, -123456789012345n])
     expect(await runtime.call(module.hook("echo"), wide)).toEqual(wide)
+    const [first, second] = await runtime.call<Uint8Array[]>(module.hook("sameView"))
+    expect(first).toBe(second)
+    expect([...first!]).toEqual([1, 2])
   }, 40_000)
 
   it("preserves rich types and graph cycles instead of invoking JSON", async () => {
@@ -276,8 +280,10 @@ describe("native WASM value bridge", () => {
 
   it("preserves synchronous host metadata, receivers and rethrown guest exceptions", async () => {
     const { runtime, module } = await setup()
-    const sum = runtime.function("sum", 1, function (this: { base: number }, value) {
-      return this.base + Number(value)
+    // Like NativeFunc, rt.function receives live Values for this and the arguments.
+    const sum = runtime.function("sum", 1, async function (this: Value, value) {
+      const base = await (await this.get("base")).toGo()
+      return Number(base) + Number(await (value as Value).toGo())
     })
     expect(await runtime.call(module.hook("sync"), sum)).toEqual(["sum", 1, 42])
     const fail = await runtime.getValue("fail")

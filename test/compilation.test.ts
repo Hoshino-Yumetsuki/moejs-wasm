@@ -45,6 +45,23 @@ function artifactAdapter(transform?: (request: WorkerRequest) => WorkerRequest):
   }
 }
 
+function recordingAdapter(sent: WorkerRequest[]): Adapter {
+  const native = nodeAdapter()
+  return {
+    loadModule: (url) => native.loadModule(url),
+    async createWorker(module, options, handlers) {
+      const endpoint = await native.createWorker(module, options, handlers)
+      return {
+        terminate: () => endpoint.terminate(),
+        postMessage(request) {
+          sent.push(request)
+          endpoint.postMessage(request)
+        }
+      }
+    }
+  }
+}
+
 async function create(adapter = artifactAdapter()) {
   const engine = await createMoeJS({ timeoutMs: 10_000, adapter })
   engines.push(engine)
@@ -73,7 +90,9 @@ it("loads serialized linked cycles and dynamic imports without reparsing runtime
   const linked = await engine.link(a, (_referrer, name) => (name === "a" ? a : b))
   const late = await engine.compile("late.js", "export function read() { return 43 }")
   for (let i = 0; i < 2; i++) {
-    const runtime = await engine.newRuntime({ importer: { resolve: () => late } })
+    const runtime = await engine.newRuntime({
+      importer: { resolve: (_referrer, name) => (name === "late" ? late : name === "a" ? a : b) }
+    })
     await runtime.load(linked)
     expect(await runtime.get("result")).toBe(42)
     expect(await runtime.call(linked.hook("dynamic"), "b")).toBe(42)
@@ -165,4 +184,164 @@ it("rejects malformed artifact imports without poisoning the runtime", async () 
   const runtime = await engine.newRuntime()
   await expect(runtime.runScript(script)).rejects.toThrow("bytecode artifact")
   expect(await runtime.runScript(script)).toBe(42)
+}, 30_000)
+
+it("sends each endpoint a module's or script's bytecode once", async () => {
+  const sent: WorkerRequest[] = []
+  const engine = await create(recordingAdapter(sent))
+  type Bytecode = { code?: string; modules?: { code?: string }[] }
+  const carried = (op: string) =>
+    sent
+      .filter((request) => request.op === op)
+      .map(({ payload }) => {
+        const { code, modules = [] } = payload as Bytecode
+        return Boolean(code) || modules.some((module) => Boolean(module.code))
+      })
+  const dep = await engine.compile("dep.js", "export const base = 40")
+  const entry = await engine.compile(
+    "entry.js",
+    'import { base } from "dep"\nexport const answer = () => base + 2'
+  )
+  const linked = await engine.link(entry, () => dep)
+  const script = await engine.compileScript("script.js", "21 * 2")
+  const runtime = await engine.newRuntime()
+  await runtime.load(linked)
+  expect(await runtime.call(linked.hook("answer"))).toBe(42)
+  expect(await runtime.runScript(script)).toBe(42)
+  expect(await runtime.runScript(script)).toBe(42)
+  expect(carried("link")).toEqual([false])
+  expect(carried("load")).toEqual([true])
+  expect(carried("runScript")).toEqual([true, false])
+  const late = await engine.compile("late.js", "export const v = 41")
+  const importer = await engine.newRuntime({ importer: { resolve: () => late } })
+  for (const name of ["first.js", "second.js"]) {
+    const importing = await engine.compileScript(
+      name,
+      '(async () => (await import("late")).v + 1)()'
+    )
+    expect(await importer.runScript(importing)).toBe(42)
+  }
+  const replies = sent
+    .filter((request) => request.op === "moduleResult")
+    .map(({ payload }) => Boolean((payload as { module: Bytecode }).module.code))
+  expect(replies).toEqual([true, false])
+  const load = sent.find((request) => request.op === "load")!.payload as Bytecode
+  expect([load.code, ...load.modules!.map((module) => module.code)].filter(Boolean)).toHaveLength(2)
+}, 30_000)
+
+it("compiles and loads modules beyond the former artifact item limit", async () => {
+  const engine = await create()
+  const source = Array.from(
+    { length: 20_000 },
+    (_, i) =>
+      `export function f${i}(a, b) { const o = { k: a, v: b, s: "s${i}" }; ` +
+      `for (let j = 0; j < 3; j++) o.k += j * ${i}; return [o.k, o.v, o.s].join("-") }`
+  ).join("\n")
+  const module = await engine.compile("wide.js", source, { maxSteps: 1e9 })
+  const runtime = await engine.newRuntime()
+  await runtime.load(module)
+  expect(await runtime.call(module.hook("f19999"), 1, 2)).toBe("59998-2-s19999")
+}, 60_000)
+
+it("uses the runtime maxSteps convention for compile budgets", async () => {
+  const engine = await createMoeJS({ timeoutMs: 10_000 })
+  engines.push(engine)
+  const source = Array.from({ length: 2_000 }, (_, i) => `export const v${i} = ${i}`).join("\n")
+  await expect(engine.compile("limited.js", source, { maxSteps: 1 })).rejects.toMatchObject({
+    kind: "budget"
+  })
+  for (const maxSteps of [0, -1]) {
+    const module = await engine.compile("unlimited.js", source, { maxSteps })
+    expect(module.exports).toHaveLength(2_000)
+  }
+  await expect(engine.compile("nan.js", source, { maxSteps: Number.NaN })).rejects.toThrow(
+    RangeError
+  )
+  const script = await engine.compileScript("script.js", "21 * 2", { maxSteps: -1 })
+  const fn = await engine.compileFunction("fn.js", "a", "return a", { maxSteps: -1 })
+  const runtime = await engine.newRuntime()
+  expect(await runtime.runScript(script)).toBe(42)
+  expect(await (await runtime.runScriptValue(fn)).call(undefined, 7)).toBe(7)
+}, 30_000)
+
+function countingAdapter(posted: (op: string) => void) {
+  const native = nodeAdapter()
+  let workers = 0
+  const adapter: Adapter = {
+    loadModule: (url) => native.loadModule(url),
+    async createWorker(module, options, handlers) {
+      workers++
+      const endpoint = await native.createWorker(module, options, handlers)
+      return {
+        terminate: () => endpoint.terminate(),
+        postMessage(request) {
+          endpoint.postMessage(request)
+          posted(request.op)
+        }
+      }
+    }
+  }
+  return { adapter, workers: () => workers }
+}
+const slowSource = "let x = 0;\n" + "x = x + 1;\n".repeat(400_000)
+
+it("aborting an in-flight compile rejects only that compile and keeps siblings working", async () => {
+  const controller = new AbortController()
+  const reason = new Error("stop this compile")
+  const { adapter } = countingAdapter((op) => {
+    if (op === "compile" && armed) controller.abort(reason)
+  })
+  let armed = false
+  const engine = await create(adapter)
+  const dep = await engine.compile("dep.js", "export const v = 41")
+  const entry = await engine.compile("entry.js", 'import { v } from "dep"\nexport const w = v + 1')
+  armed = true
+  const big = engine.compile("big.js", slowSource, { signal: controller.signal })
+  armed = false
+  const script = engine.compileScript("s.js", "1")
+  const linked = engine.link(entry, () => dep)
+  await expect(big).rejects.toBe(reason)
+  expect((await script).name).toBe("s.js")
+  expect((await linked).exports).toEqual(["w"])
+  expect((await engine.compile("after.js", "export const a = 1")).exports).toEqual(["a"])
+}, 30_000)
+
+it("a compile timeout fails only that compile and does not replace the compiler", async () => {
+  const { adapter, workers } = countingAdapter(() => {})
+  const engine = await create(adapter)
+  const before = workers()
+  const slow = engine.compile("slow.js", "let x = 0;\n" + "x = x + 1;\n".repeat(1_500_000), {
+    timeoutMs: 50
+  })
+  const queued = engine.compile("queued.js", "export const q = 1")
+  await expect(slow).rejects.toMatchObject({
+    kind: "timeout",
+    name: "TimeoutError",
+    code: "ERR_TIMEOUT",
+    message: "MoeJS worker request exceeded 50ms"
+  })
+  expect((await queued).exports).toEqual(["q"])
+  expect(workers()).toBe(before)
+}, 60_000)
+
+it("keeps a pre-aborted compile from being sent", async () => {
+  const sent: WorkerRequest[] = []
+  const engine = await create(recordingAdapter(sent))
+  const reason = new Error("already aborted")
+  await expect(
+    engine.compile("never.js", "export const n = 1", { signal: AbortSignal.abort(reason) })
+  ).rejects.toBe(reason)
+  expect(sent.some((request) => request.op === "compile")).toBe(false)
+}, 30_000)
+
+it("does not give engine.link() an overall default deadline", async () => {
+  const engine = await createMoeJS()
+  engines.push(engine)
+  const dep = await engine.compile("dep.js", "export const v = 1")
+  const entry = await engine.compile("entry.js", 'import { v } from "dep"\nexport const w = v')
+  const linked = await engine.link(entry, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    return dep
+  })
+  expect(linked.exports).toEqual(["w"])
 }, 30_000)

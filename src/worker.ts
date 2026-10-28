@@ -1,12 +1,16 @@
-import { startGoRuntime } from "./go-runtime"
+import { startGoRuntime, type GoEndpoint } from "./go-runtime"
 import { createGo } from "./go-shim.mjs"
 import { errorPayload } from "./wire"
-import type { WorkerEndpoint, WorkerMessage, WorkerRequest } from "./adapter"
+import type { WorkerMessage, WorkerRequest } from "./adapter"
 
-type Incoming = { type: "init"; module: WebAssembly.Module } | WorkerRequest
-let endpoint: WorkerEndpoint | undefined
+type Incoming =
+  | { type: "init"; module: WebAssembly.Module; json?: boolean }
+  | WorkerRequest
+  | string
+let endpoint: GoEndpoint | undefined
+let interruptWord: Int32Array | undefined
 let initialized = false
-let send: (message: WorkerMessage) => void
+let send: (message: WorkerMessage | string) => void
 let listen: (callback: (message: Incoming) => void) => void
 
 if (typeof process !== "undefined" && process.versions?.node) {
@@ -25,19 +29,34 @@ if (typeof process !== "undefined" && process.versions?.node) {
 }
 
 listen((message) => {
-  if (message.type === "init") {
+  if (typeof message === "string") {
+    try {
+      if (!endpoint) throw new Error("MoeJS worker has not initialized")
+      endpoint.postJSON(message)
+    } catch (error) {
+      send({ type: "fatal", error: errorPayload(error, "bridge") })
+    }
+  } else if (message.type === "init") {
     if (initialized) return
     initialized = true
     void startGoRuntime(message.module, createGo, {
       message: (event) => send(event),
+      json: message.json ? (event) => send(event) : undefined,
       error: (error) => send({ type: "fatal", error: errorPayload(error, "internal") })
     })
       .then((value) => {
         endpoint = value
+        if (interruptWord) value.setInterruptWord(interruptWord)
       })
       .catch((error: unknown) => {
         send({ type: "fatal", error: errorPayload(error, "internal") })
       })
+  } else if (message.type === "request" && message.op === "interruptWord") {
+    const { buffer } = message.payload as { buffer?: unknown }
+    if (typeof SharedArrayBuffer === "function" && buffer instanceof SharedArrayBuffer) {
+      interruptWord = new Int32Array(buffer, 0, 1)
+      endpoint?.setInterruptWord(interruptWord)
+    }
   } else {
     try {
       if (!endpoint) throw new Error("MoeJS worker has not initialized")

@@ -68,7 +68,8 @@ it("allows importer resolvers to query, call hooks and use native operations on 
           const native = await runtime.native()
           expect(await native.invoke("Realm")).toBe(await runtime.realm())
           await expect(runtime.eventLoop.stop()).rejects.toMatchObject({ kind: "host" })
-          await expect(runtime.clearInterrupt()).rejects.toMatchObject({ kind: "host" })
+          // As upstream, ClearInterrupt works from any goroutine, a callback's included.
+          await expect(runtime.clearInterrupt()).resolves.toBeUndefined()
           return dependency
         }
       }

@@ -90,7 +90,8 @@
     "lint-fix": "oxlint --fix && oxfmt",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
-    "test": "vitest run --root test"
+    "test": "vitest run --root test",
+    "bench": "node bench/bench.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",

@@ -1,4 +1,5 @@
-import { failure, type WireValue } from "./wire"
+import { failure, notForeign, type WireValue } from "./wire"
+import { HandleCache, hostWire, type HandleState } from "./handles"
 import type { Value, ValueScope } from "./value"
 
 export type NativePrimitive =
@@ -61,8 +62,8 @@ export const nativeTypes = {
   map: (key: NativeType, value: NativeType): NativeType => ({ kind: "map", key, value }),
   struct: (fields: NativeField[]): NativeType => ({ kind: "struct", fields })
 }
-const states = new WeakMap<NativeHandle, { scope: ValueScope; released: boolean }>()
-const handles = new WeakMap<ValueScope, Map<number, NativeHandle>>()
+const states = new WeakMap<NativeHandle, HandleState>()
+const handles = new HandleCache<NativeHandle>("native")
 
 /** A real Go value owned by one runtime. Native handles are never implicitly guest values. */
 export class NativeHandle {
@@ -72,7 +73,7 @@ export class NativeHandle {
   constructor(scope: ValueScope, id: number, kind = "native", name = "") {
     this.id = id
     this.kind = kind
-    states.set(this, { scope, released: false })
+    states.set(this, { scope, id, count: 0, released: false })
     this.name = name
   }
   private scope(): ValueScope {
@@ -110,32 +111,47 @@ export class NativeHandle {
   asValue(): Promise<Value> {
     return this.operation("nativeAsValue")
   }
+  /** Releases the handle now rather than once it is collected. */
   async release(): Promise<void> {
     const state = states.get(this)!
     if (state.released) return
-    await this.operation("nativeRelease")
+    const scope = this.scope()
     state.released = true
-    handles.get(state.scope)?.delete(this.id)
+    // Go forgets a temporary callback argument when the call ends.
+    if (state.temporary) return
+    handles.remove(this, state)
+    await scope.request("nativeRelease", {
+      native: { t: "native", id: this.id, kind: this.kind },
+      count: state.count
+    })
   }
 }
 export function createNativeHandle(
   scope: ValueScope,
   ref: { id: number; kind?: string; name?: string; temporary?: boolean }
 ): NativeHandle {
-  if (ref.temporary) return new NativeHandle(scope, ref.id, ref.kind, ref.name)
-  let cache = handles.get(scope)
-  if (!cache) handles.set(scope, (cache = new Map()))
-  let handle = cache.get(ref.id)
-  if (!handle) cache.set(ref.id, (handle = new NativeHandle(scope, ref.id, ref.kind, ref.name)))
+  if (ref.temporary) {
+    const handle = new NativeHandle(scope, ref.id, ref.kind, ref.name)
+    states.get(handle)!.temporary = true
+    return handle
+  }
+  const own = (ref as { [hostWire]?: NativeHandle })[hostWire]
+  if (own) return own
+  let handle = handles.get(scope, ref.id)
+  if (!handle) {
+    handle = new NativeHandle(scope, ref.id, ref.kind, ref.name)
+    handles.add(scope, ref.id, handle, states.get(handle)!)
+  }
+  states.get(handle)!.count++
   return handle
 }
 export function nativeWireReference(value: unknown, scope?: ValueScope): WireValue | undefined {
   if (!(value instanceof NativeHandle)) return undefined
   const state = states.get(value)!
   if (state.released) throw failure("bridge", "Native handle has been released")
-  if (state.scope !== scope) throw failure("bridge", "Native handle belongs to another runtime")
+  if (state.scope !== scope) throw notForeign()
   state.scope.assertUsable()
-  return { t: "native", id: value.id, kind: value.kind }
+  return { t: "native", id: value.id, kind: value.kind, [hostWire]: value } as WireValue
 }
 export async function nativeRoot(
   scope: ValueScope,

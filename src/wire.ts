@@ -1,5 +1,6 @@
 import { createValue, wireReference, type ValueScope } from "./value"
 import { createNativeHandle, nativeWireReference } from "./native"
+import { weakHandles } from "./handles"
 
 export type ErrorKind =
   | "syntax"
@@ -12,6 +13,28 @@ export type ErrorKind =
   | "closed"
   | "timeout"
   | "budget"
+  | "fatal"
+
+export type ErrorCode =
+  | "ERR_INTERRUPTED"
+  | "ERR_INTERNAL"
+  | "ERR_SYNTAX"
+  | "ERR_TIMEOUT"
+  | "ERR_MEMORY_LIMIT"
+  | "ERR_EXECUTION_BUDGET"
+  | "ERR_HOOK_NOT_FOUND"
+  | "ERR_NOT_CALLABLE"
+  | "ERR_FOREIGN"
+  | "ERR_MODULE_PENDING"
+  | "ERR_NO_RESOLVER"
+  | "ERR_MODULE_RESOLVE"
+  | "ERR_TOO_DEEP"
+  | "ERR_DECODE_LIMIT"
+  | "ERR_LOSSY_JSON"
+  | "ERR_DECODE_TYPE"
+  | "ERR_DECODE_TARGET"
+  | "ERR_LOOP_TERMINATED"
+  | "ERR_LOOP_RUNNING"
 
 export interface ErrorPayload {
   kind: ErrorKind
@@ -36,7 +59,12 @@ export interface ErrorPayload {
   target?: string
   field?: string
   offset?: number
+  hostId?: number
+  reasonId?: number
 }
+
+// Host objects a layer came from, kept off the instance so it stays a plain record.
+const origins = new WeakMap<MoeJSError, { hostId?: number; reasonId?: number; origin?: object }>()
 
 export class MoeJSError extends Error {
   readonly kind: ErrorKind
@@ -45,7 +73,8 @@ export class MoeJSError extends Error {
   readonly column?: number
   readonly value?: unknown
   readonly reason?: unknown
-  override readonly cause?: MoeJSError
+  /** The next error layer; the host object itself when a host function threw it. */
+  override readonly cause?: unknown
   readonly code?: string
   readonly path?: string
   readonly valueKind?: string
@@ -66,9 +95,20 @@ export class MoeJSError extends Error {
     this.file = error.file
     this.line = error.line
     this.column = error.column
-    this.value = error.value ? decode(error.value, scope) : undefined
-    this.reason = error.reason ? decode(error.reason, scope) : undefined
-    this.cause = error.cause ? new MoeJSError(error.cause, scope) : undefined
+    const original = error.reasonId ? scope?.hostObject?.(error.reasonId) : undefined
+    // Go counted the handles in the wires the host original replaces.
+    if (original) scope?.discard?.([error.value, error.reason])
+    this.value = original ?? (error.value ? decode(error.value, scope) : undefined)
+    this.reason = original ?? (error.reason ? decode(error.reason, scope) : undefined)
+    const thrown = error.cause?.hostId ? scope?.hostObject?.(error.cause.hostId) : undefined
+    if (thrown) scope?.discard?.(error.cause)
+    this.cause = thrown ?? (error.cause ? moeJSError(error.cause, scope) : undefined)
+    if (error.hostId || error.reasonId)
+      origins.set(this, {
+        hostId: error.hostId,
+        reasonId: error.reasonId,
+        origin: error.hostId ? scope?.hostObject?.(error.hostId) : undefined
+      })
     this.code = error.code
     this.path = error.path
     this.valueKind = error.valueKind
@@ -81,7 +121,15 @@ export class MoeJSError extends Error {
     this.target = error.target
     this.field = error.field
     this.offset = error.offset
-    if (error.stack) this.stack = error.stack
+    if (error.stack !== undefined) this.stack = error.stack
+  }
+
+  /** Like Go's errors.Is: matches a code or a host object on this error or any cause. */
+  is(target: ErrorCode | (string & {}) | object): boolean {
+    if (typeof target === "string" ? this.code === target : this === target) return true
+    if (typeof target !== "string" && origins.get(this)?.origin === target) return true
+    if (this.cause instanceof MoeJSError) return this.cause.is(target)
+    return typeof target !== "string" && this.cause === target
   }
 }
 
@@ -90,18 +138,49 @@ export class TimeoutError extends MoeJSError {
     super({
       kind: "timeout",
       name: "TimeoutError",
-      message: `MoeJS worker request exceeded ${timeoutMs}ms`
+      message: `MoeJS worker request exceeded ${timeoutMs}ms`,
+      code: "ERR_TIMEOUT"
     })
   }
+}
+
+/** Upstream MemoryLimitError: limit, allocated and live are always set; stack is "" when no JS ran. */
+export class MemoryLimitError extends MoeJSError {
+  declare readonly limit: number
+  declare readonly allocated: number
+  declare readonly live: number
+}
+
+export function moeJSError(error: ErrorPayload, scope?: ValueScope): MoeJSError {
+  return error.name === "MemoryLimitError" && error.limit !== undefined
+    ? new MemoryLimitError(error, scope)
+    : new MoeJSError(error, scope)
+}
+
+export const sentinel = (code: ErrorCode, message: string) =>
+  new MoeJSError({ kind: "bridge", name: "Error", message, code })
+export const hookNotFound = () => sentinel("ERR_HOOK_NOT_FOUND", "moejs: hook not found")
+export const notForeign = () =>
+  sentinel("ERR_FOREIGN", "moejs: function or generator of another runtime")
+export const loopRunning = () => sentinel("ERR_LOOP_RUNNING", "eventloop: loop is already running")
+export function interruptMessage(reason: unknown): string {
+  return reason === undefined ? "interrupted" : "interrupted: " + errorPayload(reason).message
 }
 
 export function failure(kind: ErrorKind, message: string): MoeJSError {
   return new MoeJSError({ kind, name: "MoeJSError", message })
 }
 
-export function errorPayload(error: unknown, kind: ErrorKind = "host"): ErrorPayload {
+export function errorPayload(
+  error: unknown,
+  kind: ErrorKind = "host",
+  retain?: (value: object) => number
+): ErrorPayload {
   if (error instanceof MoeJSError) {
+    const { hostId, reasonId } = origins.get(error) ?? {}
     return {
+      hostId,
+      reasonId,
       kind: error.kind,
       name: error.name,
       message: error.message,
@@ -121,7 +200,7 @@ export function errorPayload(error: unknown, kind: ErrorKind = "host"): ErrorPay
       target: error.target,
       field: error.field,
       offset: error.offset,
-      cause: error.cause ? errorPayload(error.cause, kind) : undefined
+      cause: error.cause ? errorPayload(error.cause, kind, retain) : undefined
     }
   }
   if (error instanceof Error) {
@@ -130,7 +209,8 @@ export function errorPayload(error: unknown, kind: ErrorKind = "host"): ErrorPay
       name: error.name,
       message: error.message,
       stack: error.stack,
-      cause: error.cause !== undefined ? errorPayload(error.cause, kind) : undefined
+      cause: error.cause !== undefined ? errorPayload(error.cause, kind, retain) : undefined,
+      hostId: retain?.(error)
     }
   }
   let message: string
@@ -165,17 +245,28 @@ export type WireValue =
   | { t: "date"; v: WireValue; id?: number }
   | { t: "regexp"; v: [WireValue, WireValue, WireValue]; id?: number }
   | { t: "error"; v: [string | WireValue, WireValue][]; id?: number }
-  | { t: "buffer"; v: number[]; id?: number; kind?: string }
+  | { t: "buffer"; v: string; id?: number; kind?: string }
   | { t: "view"; v: WireValue; kind: string; offset: number; length: number; id?: number }
   | { t: "link"; id: number }
-  | { t: "ref"; id: number; kind?: string }
-  | { t: "function"; id: number; name?: string; length?: number; async?: boolean }
+  | { t: "ref"; id?: number; kind?: string; v?: WireValue; temporary?: boolean }
+  | { t: "rawjson"; v: string }
+  | { t: "function"; id: number; name?: string; length?: number; async?: boolean; raw?: boolean }
 
 export type HostFunction = (...args: unknown[]) => unknown
 export interface HostFunctionOptions {
   name?: string
   length?: number
   async?: boolean
+  /** NativeFunc arguments: call-scoped live Value handles instead of copies. */
+  raw?: boolean
+}
+
+/** json.RawMessage: JSON text that upstream FromGo parses lazily and ToGo returns unread. */
+export class RawMessage {
+  readonly text: string
+  constructor(text: string | Uint8Array) {
+    this.text = typeof text === "string" ? text : new TextDecoder().decode(text)
+  }
 }
 const functionOptions = new WeakMap<HostFunction, HostFunctionOptions>()
 export function defineHostFunction(
@@ -189,16 +280,48 @@ export function defineHostFunction(
   return wrapper
 }
 
-const hostSymbols = new Map<symbol, number>()
-const symbolsByID = new Map<number, symbol>()
+// Symbols are held weakly where the host allows it (ES2023): one neither side holds is recreated unobservably.
+const weakSymbols = (() => {
+  if (!weakHandles) return false
+  try {
+    new WeakRef(Symbol() as unknown as object)
+    return true
+  } catch {
+    return false
+  }
+})()
+class SymbolTable {
+  private readonly refs = new Map<number, WeakRef<object> | symbol>()
+  private readonly dropped = weakSymbols
+    ? new FinalizationRegistry<number>((id) => {
+        const ref = this.refs.get(id)
+        if (ref instanceof WeakRef && ref.deref() === undefined) this.refs.delete(id)
+      })
+    : undefined
+  get(id: number): symbol | undefined {
+    const ref = this.refs.get(id)
+    return (ref instanceof WeakRef ? ref.deref() : ref) as symbol | undefined
+  }
+  set(id: number, symbol: symbol): void {
+    const key = symbol as unknown as object
+    this.refs.set(id, this.dropped ? new WeakRef(key) : symbol)
+    this.dropped?.register(key, id)
+  }
+}
+function symbolMap<V>(): WeakMap<symbol, V> {
+  return (weakSymbols ? new WeakMap() : new Map()) as unknown as WeakMap<symbol, V>
+}
+const hostSymbols = symbolMap<number>()
+const symbolsByID = new SymbolTable()
+let nextHostSymbol = 1
 const wellKnownSymbols = new Map<symbol, string>(
   Object.getOwnPropertyNames(Symbol).flatMap((name) => {
     const value = Reflect.get(Symbol, name)
     return typeof value === "symbol" ? [[value, name] as [symbol, string]] : []
   })
 )
-const scopedSymbols = new WeakMap<ValueScope, Map<number, symbol>>()
-const scopedSymbolWires = new WeakMap<ValueScope, Map<symbol, WireValue>>()
+const scopedSymbols = new WeakMap<ValueScope, SymbolTable>()
+const scopedSymbolWires = new WeakMap<ValueScope, WeakMap<symbol, WireValue>>()
 export function encode(
   value: unknown,
   register?: (fn: HostFunction) => number,
@@ -208,20 +331,18 @@ export function encode(
   const pending: object[] = []
   const nodes: WireValue[] = []
   function visit(value: unknown): WireValue {
-    const reference = wireReference(value, scope) ?? nativeWireReference(value, scope)
-    if (reference) return reference
     if (value === undefined) return { t: "undefined" }
     if (value === null) return { t: "null" }
     switch (typeof value) {
       case "boolean":
         return { t: "boolean", v: value }
       case "string":
-        return /[\uD800-\uDFFF]/u.test(value)
-          ? {
+        return value.isWellFormed()
+          ? { t: "string", v: value }
+          : {
               t: "string16",
               v: Array.from({ length: value.length }, (_, index) => value.charCodeAt(index))
             }
-          : { t: "string", v: value }
       case "number":
         return {
           t: "number",
@@ -240,14 +361,15 @@ export function encode(
       case "symbol": {
         const guestSymbol = scope ? scopedSymbolWires.get(scope)?.get(value) : undefined
         if (guestSymbol) return guestSymbol
-        let id = hostSymbols.get(value)
-        if (!id) {
-          id = hostSymbols.size + 1
+        const known = wellKnownSymbols.get(value)
+        const key = Symbol.keyFor(value)
+        // Go finds well-known and registered symbols by name.
+        let id = known || key !== undefined ? 0 : hostSymbols.get(value)
+        if (id === undefined) {
+          id = nextHostSymbol++
           hostSymbols.set(value, id)
           symbolsByID.set(id, value)
         }
-        const known = wellKnownSymbols.get(value)
-        const key = Symbol.keyFor(value)
         return {
           t: "symbol",
           id,
@@ -265,6 +387,9 @@ export function encode(
         }
       }
       case "object": {
+        const reference = wireReference(value, scope) ?? nativeWireReference(value, scope)
+        if (reference) return reference
+        if (value instanceof RawMessage) return { t: "rawjson", v: value.text }
         const previous = seen.get(value)
         if (previous) return { t: "link", id: previous }
         const id = seen.size + 1
@@ -296,7 +421,7 @@ export function encode(
         t: "buffer",
         id,
         kind: value instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer",
-        v: Array.from(new Uint8Array(value))
+        v: toBase64(new Uint8Array(value))
       }
     if (ArrayBuffer.isView(value)) {
       const length =
@@ -322,21 +447,62 @@ export function encode(
         t: "error",
         id,
         v: [...new Set(["name", "message", "stack", ...Object.getOwnPropertyNames(value)])].map(
-          (key) => [visit(key), visit(Reflect.get(value, key))]
+          (key) => [visitKey(key), visit(Reflect.get(value, key))]
         )
       }
-    return {
-      t: "object",
-      id,
-      v: Reflect.ownKeys(value)
-        .filter((key) => Object.getOwnPropertyDescriptor(value, key)?.enumerable)
-        .map((key) => [visit(key), visit(Reflect.get(value, key))])
-    }
+    const entries: [string | WireValue, WireValue][] = []
+    for (const key of Object.keys(value))
+      entries.push([visitKey(key), visit(Reflect.get(value, key))])
+    for (const key of Object.getOwnPropertySymbols(value))
+      if (Object.prototype.propertyIsEnumerable.call(value, key))
+        entries.push([visit(key), visit(Reflect.get(value, key))])
+    return { t: "object", id, v: entries }
+  }
+  function visitKey(key: string): string | WireValue {
+    return key.isWellFormed() ? key : visit(key)
   }
   const root = visit(value)
   for (let index = 0; index < pending.length; index++)
     nodes.push(object(pending[index]!, index + 1))
   return nodes.length ? { t: "graph", root, v: nodes } : root
+}
+
+const nativeBase64 = Uint8Array as unknown as {
+  fromBase64?: (text: string) => Uint8Array
+  prototype: { toBase64?: () => string }
+}
+const NodeBuffer = (
+  globalThis as {
+    Buffer?: {
+      from(
+        buffer: ArrayBufferLike,
+        offset: number,
+        length: number
+      ): { toString(encoding: string): string }
+      from(text: string, encoding: string): Uint8Array
+    }
+  }
+).Buffer
+function toBase64(bytes: Uint8Array): string {
+  if (nativeBase64.prototype.toBase64) return nativeBase64.prototype.toBase64.call(bytes)
+  if (NodeBuffer)
+    return NodeBuffer.from(bytes.buffer, bytes.byteOffset, bytes.length).toString("base64")
+  let binary = ""
+  for (let offset = 0; offset < bytes.length; offset += 0x8000)
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+  return btoa(binary)
+}
+function fromBase64(text: string): Uint8Array<ArrayBuffer> {
+  if (nativeBase64.fromBase64) return nativeBase64.fromBase64(text) as Uint8Array<ArrayBuffer>
+  if (NodeBuffer) {
+    const view = NodeBuffer.from(text, "base64")
+    // Node may pool small Buffers; copy into an exact, unshared ArrayBuffer.
+    return new Uint8Array(view)
+  }
+  const binary = atob(text)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
+  return bytes
 }
 
 const viewConstructors: Record<
@@ -356,34 +522,58 @@ const viewConstructors: Record<
   BigUint64Array,
   DataView
 }
+const containerTags = new Set(["array", "object", "map", "set", "error"])
+
+function decodeNumber(value: Extract<WireValue, { t: "number" }>["v"]): number {
+  return typeof value === "number" ? value : value === "-0" ? -0 : Number(value)
+}
+
 export function decode(value: WireValue, scope?: ValueScope): unknown {
+  switch (value.t) {
+    case "undefined":
+      return undefined
+    case "null":
+      return null
+    case "boolean":
+    case "string":
+      return value.v
+    case "number":
+      return decodeNumber(value.v)
+  }
   const seen = new Map<number, unknown>()
   let graph: WireValue[] = []
-  const graphValues = new Map<number, unknown>()
+  let graphValues: unknown[] = []
+  let resolved: boolean[] = []
+  function resolve(index: number): unknown {
+    if (!resolved[index]) {
+      const node = graph[index]
+      if (!node) throw failure("bridge", "Invalid graph node")
+      graphValues[index] = visit(node)
+      resolved[index] = true
+    }
+    return graphValues[index]
+  }
   function visit(value: WireValue): unknown {
     switch (value.t) {
       case "graph": {
         graph = value.v
+        graphValues = new Array(graph.length)
+        resolved = new Array<boolean>(graph.length).fill(false)
+        // Containers first so cycles can reach them, and buffers before their views.
         for (let i = 0; i < graph.length; i++) {
           const node = graph[i]!
-          if (["array", "object", "map", "set", "error"].includes(node.t))
-            graphValues.set(i, visit({ ...node, v: [] } as WireValue))
+          if (containerTags.has(node.t)) {
+            graphValues[i] = container(node)
+            resolved[i] = true
+          }
         }
-        for (let i = 0; i < graph.length; i++)
-          if (!graphValues.has(i) && graph[i]!.t !== "view") graphValues.set(i, visit(graph[i]!))
-        for (let i = 0; i < graph.length; i++)
-          if (!graphValues.has(i)) graphValues.set(i, visit(graph[i]!))
-        for (const node of graph)
-          if (["array", "object", "map", "set", "error"].includes(node.t)) visit(node)
+        for (let i = 0; i < graph.length; i++) if (graph[i]!.t !== "view") resolve(i)
+        for (let i = 0; i < graph.length; i++) resolve(i)
+        for (const node of graph) if (containerTags.has(node.t)) visit(node)
         return visit(value.root)
       }
       case "node":
-        if (!graphValues.has(value.id)) {
-          const node = graph[value.id]
-          if (!node) throw failure("bridge", "Invalid graph node")
-          graphValues.set(value.id, visit(node))
-        }
-        return graphValues.get(value.id)
+        return resolve(value.id)
       case "native":
         if (!scope) throw failure("bridge", "Native reference requires a runtime scope")
         return createNativeHandle(scope, value)
@@ -394,15 +584,17 @@ export function decode(value: WireValue, scope?: ValueScope): unknown {
           return symbol
         }
         if (value.kind === "global") return Symbol.for(value.name ?? "")
-        if (value.id > 0 && symbolsByID.has(value.id)) return symbolsByID.get(value.id)
+        const host = value.id > 0 ? symbolsByID.get(value.id) : undefined
+        if (host) return host
         let symbols = scope ? scopedSymbols.get(scope) : undefined
-        if (!symbols && scope) scopedSymbols.set(scope, (symbols = new Map()))
-        if (symbols?.has(value.id)) return symbols.get(value.id)
+        if (!symbols && scope) scopedSymbols.set(scope, (symbols = new SymbolTable()))
+        const known = symbols?.get(value.id)
+        if (known) return known
         const symbol = Symbol(value.v ? (visit(value.v) as string | undefined) : undefined)
         symbols?.set(value.id, symbol)
         if (scope) {
           let wires = scopedSymbolWires.get(scope)
-          if (!wires) scopedSymbolWires.set(scope, (wires = new Map()))
+          if (!wires) scopedSymbolWires.set(scope, (wires = symbolMap()))
           wires.set(symbol, value)
         }
         return symbol
@@ -421,7 +613,7 @@ export function decode(value: WireValue, scope?: ValueScope): unknown {
         return text
       }
       case "number":
-        return typeof value.v === "number" ? value.v : value.v === "-0" ? -0 : Number(value.v)
+        return decodeNumber(value.v)
       case "bigint":
         return BigInt(value.v)
       case "ref":
@@ -432,48 +624,44 @@ export function decode(value: WireValue, scope?: ValueScope): unknown {
         return seen.get(value.id)
       case "function":
         throw failure("bridge", "Unexpected host function in guest result")
+      case "rawjson":
+        return new RawMessage(value.v)
       default: {
-        let out: unknown
-        switch (value.t) {
-          case "array":
-            out = []
-            break
-          case "object":
-            out = {}
-            break
-          case "map":
-            out = new Map()
-            break
-          case "set":
-            out = new Set()
-            break
-          case "error":
-            out = new Error()
-            break
-          case "date":
-            out = new Date(visit(value.v) as number)
-            break
-          case "regexp":
-            out = new RegExp(String(visit(value.v[0])), String(visit(value.v[1])))
-            break
-          case "buffer":
-            if (value.kind === "SharedArrayBuffer") {
-              if (typeof SharedArrayBuffer === "undefined")
-                throw failure("bridge", "SharedArrayBuffer is unavailable in this host")
-              const buffer = new SharedArrayBuffer(value.v.length)
-              new Uint8Array(buffer).set(value.v)
-              out = buffer
-            } else out = Uint8Array.from(value.v).buffer
-            break
-          case "view": {
-            const ctor = viewConstructors[value.kind]
-            if (!ctor) throw failure("bridge", "Unsupported binary view " + value.kind)
-            out = new ctor(visit(value.v) as ArrayBuffer, value.offset, value.length)
-            break
+        let out = value.id ? seen.get(value.id) : undefined
+        if (out === undefined) {
+          switch (value.t) {
+            case "array":
+            case "object":
+            case "map":
+            case "set":
+            case "error":
+              out = container(value)
+              break
+            case "date":
+              out = new Date(visit(value.v) as number)
+              break
+            case "regexp":
+              out = new RegExp(String(visit(value.v[0])), String(visit(value.v[1])))
+              break
+            case "buffer":
+              if (value.kind === "SharedArrayBuffer") {
+                if (typeof SharedArrayBuffer === "undefined")
+                  throw failure("bridge", "SharedArrayBuffer is unavailable in this host")
+                const bytes = fromBase64(value.v)
+                const buffer = new SharedArrayBuffer(bytes.length)
+                new Uint8Array(buffer).set(bytes)
+                out = buffer
+              } else out = fromBase64(value.v).buffer
+              break
+            case "view": {
+              const ctor = viewConstructors[value.kind]
+              if (!ctor) throw failure("bridge", "Unsupported binary view " + value.kind)
+              out = new ctor(visit(value.v) as ArrayBuffer, value.offset, value.length)
+              break
+            }
           }
+          if (value.id) seen.set(value.id, out)
         }
-        if (value.id && seen.has(value.id)) out = seen.get(value.id)
-        if (value.id) seen.set(value.id, out)
         switch (value.t) {
           case "regexp":
             Reflect.set(out as object, "lastIndex", visit(value.v[2]))
@@ -482,17 +670,21 @@ export function decode(value: WireValue, scope?: ValueScope): unknown {
             for (const item of value.v) (out as unknown[]).push(visit(item))
             break
           case "object":
+            for (const [key, item] of value.v) {
+              const name = typeof key === "string" ? key : (visit(key) as PropertyKey)
+              const data = visit(item)
+              // Assignment equals CreateDataProperty unless Object.prototype has the name.
+              if (typeof name === "string" && !(name in Object.prototype))
+                (out as Record<string, unknown>)[name] = data
+              else defineData(out as object, name, data)
+            }
+            break
           case "error":
             for (const [key, item] of value.v)
-              Object.defineProperty(
-                out,
+              defineData(
+                out as object,
                 typeof key === "string" ? key : (visit(key) as PropertyKey),
-                {
-                  value: visit(item),
-                  writable: true,
-                  configurable: true,
-                  enumerable: true
-                }
+                visit(item)
               )
             break
           case "map":
@@ -507,5 +699,28 @@ export function decode(value: WireValue, scope?: ValueScope): unknown {
       }
     }
   }
+  function container(node: WireValue): unknown {
+    const out =
+      node.t === "array"
+        ? []
+        : node.t === "object"
+          ? {}
+          : node.t === "map"
+            ? new Map()
+            : node.t === "set"
+              ? new Set()
+              : new Error()
+    if ("id" in node && node.id) seen.set(node.id, out)
+    return out
+  }
   return visit(value)
+}
+
+function defineData(target: object, key: PropertyKey, value: unknown) {
+  Object.defineProperty(target, key, {
+    value,
+    writable: true,
+    configurable: true,
+    enumerable: true
+  })
 }

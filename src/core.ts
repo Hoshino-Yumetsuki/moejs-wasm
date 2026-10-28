@@ -1,30 +1,41 @@
 import type { Adapter } from "./adapter"
-import { Transport, type RequestOptions } from "./transport"
+import {
+  checkTimeout,
+  defaultTimeoutMs,
+  EndpointRecycled,
+  Transport,
+  type RequestOptions
+} from "./transport"
 import {
   defineHostFunction,
   errorPayload,
   failure,
+  hookNotFound,
   MoeJSError,
+  sentinel,
   TimeoutError,
+  type ErrorPayload,
   type HostFunction,
   type WireValue
 } from "./wire"
+import { weakHandles } from "./handles"
 import { Value, type DecodeOptions, type JSONOptions } from "./value"
 import {
   EventLoop,
-  createHostPromise,
+  createRuntimePromise,
   inspectPromise,
-  setPromiseRejectionTracker,
+  rejectionTrackerWire,
   type EventLoopOptions,
   type PromiseRejectionEvent
 } from "./event-loop"
 import { RuntimeNetwork, networkWireOptions, type NetworkOptions } from "./network"
 import { NativeHandle, nativeRoot, newNativeDecodeTarget, type NativeType } from "./native"
 
-export { MoeJSError, TimeoutError, defineHostFunction } from "./wire"
+export { MoeJSError, MemoryLimitError, RawMessage, TimeoutError, defineHostFunction } from "./wire"
 export { Value } from "./value"
+export type { ObjectClass, PropertyDescriptor, ValueType } from "./value"
 export { EventLoop } from "./event-loop"
-export type { ErrorKind, ErrorPayload, HostFunction, HostFunctionOptions } from "./wire"
+export type { ErrorCode, ErrorKind, ErrorPayload, HostFunction, HostFunctionOptions } from "./wire"
 export type { DecodeOptions, JSONOptions } from "./value"
 export { NativeHandle, nativeTypes } from "./native"
 export type {
@@ -34,14 +45,58 @@ export type {
   NativeJSONCodec,
   NativeTextCodec
 } from "./native"
+export type IntrinsicName =
+  | "ObjectPrototype"
+  | "FunctionPrototype"
+  | "ArrayPrototype"
+  | "StringPrototype"
+  | "NumberPrototype"
+  | "BooleanPrototype"
+  | "ErrorPrototype"
+  | "RegExpPrototype"
+  | "DatePrototype"
+  | "BigIntPrototype"
+  | "ArrayIteratorPrototype"
+  | "ObjectCtor"
+  | "FunctionCtor"
+  | "ArrayCtor"
+  | "StringCtor"
+  | "NumberCtor"
+  | "BooleanCtor"
+  | "RegExpCtor"
+  | "DateCtor"
+  | "JSON"
+  | "Math"
+  | "SymbolPrototype"
+  | "SymbolCtor"
+  | "IteratorPrototype"
+  | "StringIteratorPrototype"
+  | "MapPrototype"
+  | "MapCtor"
+  | "MapIteratorPrototype"
+  | "SetPrototype"
+  | "SetCtor"
+  | "SetIteratorPrototype"
+  | "WeakMapPrototype"
+  | "WeakMapCtor"
+  | "WeakSetPrototype"
+  | "WeakSetCtor"
+  | "WeakRefPrototype"
+  | "WeakRefCtor"
+  | "AggregateErrorPrototype"
+  | "AggregateErrorCtor"
+  | "RegExpStringIteratorPrototype"
 export type LiveRoots = (add: (value: Value) => void) => void | Promise<void>
 export type {
   EventLoopOptions,
   PromiseResult,
   PromiseRejectionEvent,
-  HostPromise
+  HostPromise,
+  LoopPromise,
+  LoopTask
 } from "./event-loop"
-export type { NetworkOptions, NetworkRequest } from "./network"
+export type { CookieJar, NetworkOptions, NetworkRequest, RuntimeNetwork } from "./network"
+export { ErrUseLastResponse } from "./network"
 export type { RequestOptions } from "./transport"
 export type {
   Adapter,
@@ -56,12 +111,15 @@ export interface EngineOptions {
   timeoutMs?: number
   wasmURL?: string | URL
   workerURL?: string | URL
+  /** Runtime endpoints started ahead of newRuntime (worker adapters only). Default 0. */
+  warmRuntimes?: number
 }
 export interface CoreOptions extends EngineOptions {
   adapter: Adapter
 }
 export interface CompileOptions extends RequestOptions {
   typeScript?: boolean
+  /** Unset scales the default with the source; 0 or a negative value means no limit. */
   maxSteps?: number
 }
 export interface FunctionOptions extends CompileOptions {
@@ -73,14 +131,25 @@ export interface RuntimeOptions {
   mutableIntrinsics?: boolean
   disableDynamicCode?: boolean
   maxDynamicSource?: number
+  /** BCP 47 tag of the default Intl locale; "" or a malformed tag means "en-US". */
   locale?: string
+  /** Date's local zone, a name time.LoadLocation takes ("" is UTC); omitted means the host's zone. */
   timeZone?: string
   timeoutMs?: number
+  /** Steps per task; unset means 1,000,000, 0 or a negative value no limit. */
   maxSteps?: number
   importer?: Importer
   network?: NetworkOptions
-  eventLoop?: EventLoopOptions
-  onPromiseRejection?: (event: PromiseRejectionEvent) => void
+  /** false leaves out webapi.Install (fetch, URL, streams, ...); timers stay with the event loop. */
+  webAPI?: boolean
+  /** false gives a bare runtime: no timers, Web APIs or loop, as without eventloop.New. */
+  eventLoop?: EventLoopOptions | false
+  /** Runs synchronously in the operation that rejected or handled the promise. */
+  onPromiseRejection?: (event: PromiseRejectionEvent) => unknown
+  /** GOGC of this runtime's Go instance (debug.SetGCPercent); negative turns collection off. */
+  gcPercent?: number
+  /** GOMEMLIMIT of this runtime's Go instance in bytes (debug.SetMemoryLimit), not the guest's memoryLimit. */
+  goMemoryLimit?: number
 }
 export interface Stats {
   AllocatedBytes: number
@@ -111,10 +180,11 @@ export interface Script {
   readonly name: string
 }
 export type Referrer = Module | Script | NativeHandle
+/** A nullish module is upstream's nil: "the host loaded no module". */
 export type Resolver = (
   referrer: Referrer | undefined,
   specifier: string
-) => Module | Promise<Module>
+) => Module | null | undefined | Promise<Module | null | undefined>
 export interface Importer {
   resolve?: Resolver
   meta?: (
@@ -123,6 +193,8 @@ export interface Importer {
   ) => void | Record<string, unknown> | Promise<void | Record<string, unknown>>
 }
 interface ModuleRecord {
+  // A graph keeps its descriptors, so an import() inside any of them finds its referrer.
+  module: Module
   data: ModuleData
   resolutions: Map<string, ModuleData>
 }
@@ -130,14 +202,13 @@ interface ModuleData {
   engine: Engine
   moduleId: number
   name: string
-  source: string
   typeScript: boolean
   code: string
   earlyCode: string
-  ownExports: readonly string[]
+  links: boolean
   requestLocations?: Record<string, { line: number; column: number }>
   graph?: Map<number, ModuleRecord>
-  descriptor?: Module
+  linkId?: number
 }
 interface ScriptData {
   engine: Engine
@@ -151,24 +222,37 @@ interface ModuleMetadata {
   requests: string[]
   code: string
   earlyCode: string
+  links: boolean
   requestLocations: Record<string, { line: number; column: number }>
 }
 interface ScriptMetadata {
   name: string
   code: string
+  // ScriptOrModule: its import() or import.meta needs the descriptor for the realm's life.
+  referrer: boolean
 }
 const modules = new WeakMap<Module, ModuleData>()
 const scripts = new WeakMap<Script, ScriptData>()
 const hooks = new WeakSet<Hook>()
 
-function timeout(value = 1000) {
-  if (!Number.isFinite(value) || value <= 0 || value > 2_147_483_647)
-    throw new RangeError("timeoutMs must be positive, finite, and at most 2147483647")
-  return value
+function loopWireOptions(transport: Transport, options: EventLoopOptions | false | undefined) {
+  if (options === false) return { disabled: true }
+  const onError = options?.onError
+  return {
+    onError: onError
+      ? transport.encode(
+          defineHostFunction((text: unknown) =>
+            onError(new MoeJSError(JSON.parse(text as string) as ErrorPayload, transport))
+          )
+        )
+      : undefined,
+    resetMemoryPerTask: options?.resetMemoryPerTask ?? false
+  }
 }
-function compileBudget(value?: number) {
-  if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0))
-    throw new RangeError("maxSteps must be a positive safe integer")
+
+function stepBudget(value?: number) {
+  if (value !== undefined && !Number.isSafeInteger(value))
+    throw new RangeError("maxSteps must be a safe integer; 0 or a negative value means no limit")
   return value
 }
 
@@ -178,7 +262,21 @@ export class Engine {
   private readonly compilers = new Set<Transport>()
   private closed = false
   private compiler: Transport
-  private readonly descriptors = new Map<number, Referrer>()
+  private readonly warm: Transport[] = []
+  private warmFailures = 0
+  private readonly descriptors = new Map<number, WeakRef<Referrer> | Referrer>()
+  private readonly referrers = new Map<number, Script>()
+  private readonly runtimeTransports = new Set<Transport>()
+  // A dropped descriptor's bytecode is released where Go holds it.
+  private readonly collected = weakHandles
+    ? new FinalizationRegistry<{ kind?: "script" | "module"; id: number }>(({ kind, id }) => {
+        const entry = this.descriptors.get(id)
+        if (entry instanceof WeakRef && entry.deref() === undefined) this.descriptors.delete(id)
+        if (kind)
+          for (const transport of kind === "script" ? this.runtimeTransports : [this.compiler])
+            if (transport.held.delete(id)) transport.releaseHandle(kind, id, 0)
+      })
+    : undefined
   readonly timeoutMs: number
 
   /** Use createMoeJS to initialize the engine before compiling. */
@@ -186,22 +284,72 @@ export class Engine {
     private readonly module: WebAssembly.Module,
     private readonly options: CoreOptions
   ) {
-    this.timeoutMs = timeout(options.timeoutMs)
+    this.timeoutMs = checkTimeout(options.timeoutMs ?? defaultTimeoutMs)
+    const warm = options.warmRuntimes ?? 0
+    if (!Number.isSafeInteger(warm) || warm < 0)
+      throw new RangeError("warmRuntimes must be a nonnegative integer")
     this.compiler = this.newCompiler()
+    void this.compiler.ready.then(
+      () => this.refillWarm(),
+      () => undefined
+    )
+  }
+  private newTransport(timeoutMs = this.options.timeoutMs) {
+    return new Transport(this.module, this.options.adapter, this.options.workerURL, timeoutMs)
+  }
+  private refillWarm() {
+    while (!this.closed && this.warm.length < (this.options.warmRuntimes ?? 0)) {
+      const transport = this.newTransport()
+      this.warm.push(transport)
+      void transport.ready.then(
+        () => {
+          this.warmFailures = 0
+        },
+        () => undefined
+      )
+      void transport.closed.then(() => {
+        const index = this.warm.indexOf(transport)
+        if (index < 0) return
+        this.warm.splice(index, 1)
+        // Stop replacing endpoints that keep failing, such as a bad workerURL.
+        if (++this.warmFailures < 2) this.refillWarm()
+      })
+    }
+  }
+  private runtimeTransport(timeoutMs?: number) {
+    let transport = this.warm.shift()
+    while (transport?.isStopped) transport = this.warm.shift()
+    if (!transport) return this.newTransport(timeoutMs)
+    transport.useTimeout(timeoutMs)
+    return transport
   }
   private newCompiler() {
-    const transport = new Transport(
-      this.module,
-      this.options.adapter,
-      this.options.workerURL,
-      this.timeoutMs
-    )
+    const transport = this.newTransport()
+    transport.enableRecycling()
     this.compilers.add(transport)
     return transport
   }
+  /** Re-issues a request whose compiler endpoint was replaced after a sibling's abort. */
+  private async compilerRequest<T>(
+    op: string,
+    build: (held: ReadonlySet<number>) => object,
+    options: RequestOptions
+  ): Promise<T> {
+    for (;;) {
+      const compiler = this.compilerEndpoint()
+      try {
+        return await compiler.request<T>(op, build(compiler.held), options)
+      } catch (error) {
+        if (!(error instanceof EndpointRecycled)) throw error
+      }
+    }
+  }
   private compilerEndpoint() {
     this.assertOpen()
-    if (this.compiler.isStopped) this.compiler = this.newCompiler()
+    if (this.compiler.isStopped) {
+      this.compilers.delete(this.compiler)
+      this.compiler = this.newCompiler()
+    }
     return this.compiler
   }
   async initialize(): Promise<void> {
@@ -209,6 +357,14 @@ export class Engine {
   }
   private assertOpen() {
     if (this.closed) throw failure("closed", "MoeJS engine is closed")
+  }
+  private descriptor(id: number): Referrer | undefined {
+    const entry = this.descriptors.get(id)
+    return entry instanceof WeakRef ? entry.deref() : entry
+  }
+  private track(id: number, descriptor: Referrer, kind?: "script" | "module") {
+    this.descriptors.set(id, this.collected ? new WeakRef(descriptor) : descriptor)
+    this.collected?.register(descriptor, { kind, id })
   }
 
   compile(name: string, source: string, options: CompileOptions = {}): Promise<Module> {
@@ -230,25 +386,17 @@ export class Engine {
       engine: this,
       moduleId: this.nextDescriptorId++,
       name,
-      source,
       typeScript: options.typeScript ?? false,
       code: "",
       earlyCode: "",
-      ownExports: []
+      links: false
     }
-    const metadata = await this.compilerEndpoint().request<ModuleMetadata>(
-      "compile",
-      {
-        ...dataForModule(data),
-        maxSteps: compileBudget(options.maxSteps)
-      },
-      options
-    )
+    const payload = { ...dataForModule(data), source, maxSteps: stepBudget(options.maxSteps) }
+    const metadata = await this.compilerRequest<ModuleMetadata>("compile", () => payload, options)
     data.code = metadata.code
     data.earlyCode = metadata.earlyCode
+    data.links = metadata.links
     data.requestLocations = metadata.requestLocations
-    // Unlinked compiler exports are code.Module.Exports, the slots Hook treats as own.
-    data.ownExports = Object.freeze([...metadata.exports])
     return this.moduleDescriptor(data, metadata.exports, metadata.requests)
   }
   private moduleDescriptor(
@@ -256,16 +404,13 @@ export class Engine {
     exports: readonly string[],
     requests: readonly string[]
   ): Module {
+    const exported = new Set(exports)
     const descriptor: Module = Object.freeze({
       name: data.name,
       exports: Object.freeze([...exports]),
       requests: Object.freeze([...requests]),
       hook(...path: string[]): Hook {
-        if (!path.length || !exports.includes(path[0]!))
-          throw failure(
-            "bridge",
-            `Module ${data.name} does not export ${path[0] ?? "<empty path>"}`
-          )
+        if (!path.length || !exported.has(path[0]!)) throw hookNotFound()
         const hook: Hook = Object.freeze({
           module: descriptor,
           path: Object.freeze([...path]),
@@ -276,36 +421,42 @@ export class Engine {
       }
     })
     modules.set(descriptor, data)
-    data.descriptor ??= descriptor
-    if (!this.descriptors.has(data.moduleId)) this.descriptors.set(data.moduleId, descriptor)
+    // Linked modules stay in the runtimes that loaded them, so only compiled bytecode is released.
+    this.track(descriptorId(data), descriptor, data.linkId === undefined ? "module" : undefined)
     return descriptor
   }
   async link(entry: Module, resolve: Resolver, options: RequestOptions = {}): Promise<Module> {
     this.assertOpen()
     if (options.signal?.aborted) throw options.signal.reason
-    const duration = timeout(options.timeoutMs ?? this.timeoutMs)
+    const entryData = this.moduleData(entry)
+    // Like moejs.Link, a module without imports, import() or import.meta is its own graph.
+    if (!entryData.links) return entry
+    const set = options.timeoutMs ?? this.options.timeoutMs
+    const duration = set === undefined ? undefined : checkTimeout(set)
     const controller = new AbortController()
     const abort = () => controller.abort(options.signal?.reason)
     options.signal?.addEventListener("abort", abort, { once: true })
-    const timer = setTimeout(() => controller.abort(new TimeoutError(duration)), duration)
+    // Like moejs.Link, resolution has no deadline unless one is set.
+    const timer =
+      duration === undefined
+        ? undefined
+        : setTimeout(() => controller.abort(new TimeoutError(duration)), duration)
     const { promise: cancelled, reject } = Promise.withResolvers<never>()
     const cancel = () => reject(controller.signal.reason)
     controller.signal.addEventListener("abort", cancel, { once: true })
     try {
       const graph = await Promise.race([
-        this.resolveGraph(entry, resolve, new Map(), false, controller.signal),
+        this.resolveGraph(entry, resolve, new Map(), controller.signal),
         cancelled
       ])
-      const data = { ...this.moduleData(entry), graph }
+      const data: ModuleData = { ...entryData, graph, linkId: this.nextDescriptorId++ }
       const metadata = await Promise.race([
-        this.compilerEndpoint().request<ModuleMetadata>("link", dataForModule(data), {
+        this.compilerRequest<ModuleMetadata>("link", (held) => dataForModule(data, held), {
           ...options,
           signal: controller.signal
         }),
         cancelled
       ])
-      data.code = metadata.code
-      data.earlyCode = metadata.earlyCode
       return this.moduleDescriptor(data, metadata.exports, entry.requests)
     } finally {
       clearTimeout(timer)
@@ -319,11 +470,11 @@ export class Engine {
       throw failure("bridge", "Module belongs to a different MoeJS engine")
     return data
   }
+  /** Resolves each (module, specifier) once; the referrer is the module the resolver returned. */
   private async resolveGraph(
     entry: Module,
     resolve: Resolver | undefined,
-    resolutions: Map<string, Promise<Module>>,
-    useLinked = true,
+    resolutions: Map<string, Promise<Module | null | undefined>>,
     signal?: AbortSignal
   ): Promise<Map<number, ModuleRecord>> {
     const graph = new Map<number, ModuleRecord>()
@@ -331,43 +482,45 @@ export class Engine {
       if (signal?.aborted) throw signal.reason
       const data = this.moduleData(module)
       if (graph.has(data.moduleId)) return
-      const record: ModuleRecord = { data, resolutions: new Map() }
+      const record: ModuleRecord = { module, data, resolutions: new Map() }
       graph.set(data.moduleId, record)
       for (const specifier of module.requests) {
-        const key = `module:${data.moduleId}:${specifier}`
+        const key = `${data.moduleId}:${specifier}`
         let pending = resolutions.get(key)
         if (!pending) {
-          const known = useLinked
-            ? data.graph?.get(data.moduleId)?.resolutions.get(specifier)
-            : undefined
-          pending = known
-            ? Promise.resolve(this.descriptors.get(known.moduleId) as Module)
-            : Promise.resolve().then(() => {
-                if (!resolve)
-                  throw failure("bridge", `No resolver for ${specifier} in ${data.name}`)
-                return resolve(this.descriptors.get(data.moduleId), specifier)
-              })
+          pending = Promise.resolve().then(() => {
+            if (!resolve)
+              throw sentinel(
+                "ERR_NO_RESOLVER",
+                "no resolver: the host must resolve the module's requests"
+              )
+            return resolve(module, specifier)
+          })
           resolutions.set(key, pending)
         }
         let dependency: Module
         let dependencyData: ModuleData
-        const cancel = () => {
+        // An abandoned resolution must not be reused by a later request.
+        const evict = () => {
           if (resolutions.get(key) === pending) resolutions.delete(key)
         }
-        signal?.addEventListener("abort", cancel, { once: true })
+        signal?.addEventListener("abort", evict, { once: true })
         try {
           if (signal?.aborted) throw signal.reason
-          dependency = await pending
+          const resolved = await pending
           if (signal?.aborted) throw signal.reason
+          if (resolved == null) throw failure("bridge", "the resolver returned no module template")
+          dependency = resolved
           dependencyData = this.moduleData(dependency)
         } catch (error) {
-          cancel()
+          evict()
           if (signal?.aborted) throw signal.reason
           const cause = errorPayload(error)
           const location = data.requestLocations?.[specifier]
           throw new MoeJSError({
             kind: "bridge",
             name: "ResolveError",
+            code: "ERR_MODULE_RESOLVE",
             message: `${data.name}:${location?.line ?? 0}:${location?.column ?? 0}: cannot resolve module ${JSON.stringify(specifier)}: ${cause.message}`,
             file: data.name,
             ...location,
@@ -375,19 +528,10 @@ export class Engine {
             cause
           })
         } finally {
-          signal?.removeEventListener("abort", cancel)
+          signal?.removeEventListener("abort", evict)
         }
         record.resolutions.set(specifier, dependencyData)
-        const inherited = useLinked ? data.graph?.get(dependencyData.moduleId) : undefined
-        if (inherited)
-          await visit(
-            this.moduleDescriptor(
-              { ...dependencyData, graph: data.graph },
-              dependency.exports,
-              dependency.requests
-            )
-          )
-        else await visit(dependency)
+        if (!graph.has(dependencyData.moduleId)) await visit(dependency)
       }
     }
     await visit(entry)
@@ -446,38 +590,42 @@ export class Engine {
   ): Promise<Script> {
     this.assertOpen()
     const scriptId = this.nextDescriptorId++
-    const metadata = await this.compilerEndpoint().request<ScriptMetadata>(
+    const payload = { scriptId, name, ...input, maxSteps: stepBudget(options.maxSteps) }
+    const metadata = await this.compilerRequest<ScriptMetadata>(
       input.function ? "compileFunction" : "compileScript",
-      {
-        scriptId,
-        name,
-        ...input,
-        maxSteps: compileBudget(options.maxSteps)
-      },
+      () => payload,
       options
     )
     const data: ScriptData = { engine: this, scriptId, name: metadata.name, code: metadata.code }
     const descriptor: Script = Object.freeze({ name: metadata.name })
     scripts.set(descriptor, data)
-    this.descriptors.set(scriptId, descriptor)
+    if (metadata.referrer) this.referrers.set(scriptId, descriptor)
+    this.track(scriptId, descriptor, metadata.referrer ? undefined : "script")
     return descriptor
   }
 
   async newRuntime(options: RuntimeOptions = {}): Promise<Runtime> {
     this.assertOpen()
-    const transport = new Transport(
-      this.module,
-      this.options.adapter,
-      this.options.workerURL,
-      timeout(options.timeoutMs ?? this.timeoutMs)
+    const maxSteps = stepBudget(options.maxSteps)
+    const { gcPercent, goMemoryLimit } = options
+    if (gcPercent !== undefined && !Number.isSafeInteger(gcPercent))
+      throw new RangeError("gcPercent must be a safe integer")
+    if (goMemoryLimit !== undefined && !(Number.isSafeInteger(goMemoryLimit) && goMemoryLimit > 0))
+      throw new RangeError("goMemoryLimit must be a positive safe integer")
+    const timeoutMs = options.timeoutMs ?? this.options.timeoutMs
+    const transport = this.runtimeTransport(
+      timeoutMs === undefined ? undefined : checkTimeout(timeoutMs)
     )
-    const resolutions = new Map<string, Promise<Module>>()
+    // Static resolutions of import()ed graphs, once per runtime as Importer.link caches them.
+    const resolutions = new Map<string, Promise<Module | null | undefined>>()
+    // Like the realm's module map, the runtime keeps each module import() loaded as a referrer.
+    const imported = new Set<Module>()
     transport.moduleRequest = async (message, signal) => {
       const referrer =
         message.referrer?.kind === "native"
           ? (transport.decode(message.referrer.native) as NativeHandle)
           : message.referrer
-            ? this.descriptors.get(message.referrer.id)
+            ? this.descriptor(message.referrer.id)
             : undefined
       if (message.kind === "meta") {
         if (!referrer || (!(referrer instanceof NativeHandle) && !modules.has(referrer as Module)))
@@ -494,60 +642,44 @@ export class Engine {
           )
         }
       }
-      const key = `${message.referrer?.kind ?? "none"}:${message.referrer?.id ?? 0}:${message.specifier!}`
-      let pending = resolutions.get(key)
-      if (!pending) {
-        pending = Promise.resolve().then(() => {
-          if (!options.importer?.resolve)
-            throw failure("bridge", "No module resolver is configured")
-          return options.importer.resolve(referrer, message.specifier!)
-        })
-        resolutions.set(key, pending)
-      }
-      const cancel = () => {
-        if (resolutions.get(key) === pending) resolutions.delete(key)
-      }
-      signal.addEventListener("abort", cancel, { once: true })
-      let module: Module
-      try {
-        module = await pending
-        signal.throwIfAborted()
-      } catch (error) {
-        if (resolutions.get(key) === pending) resolutions.delete(key)
-        throw error
-      } finally {
-        signal.removeEventListener("abort", cancel)
-      }
+      // Like Importer.Resolve, every import() asks the host.
+      if (!options.importer?.resolve) throw failure("bridge", "No module resolver is configured")
+      const module = await options.importer.resolve(referrer, message.specifier!)
+      signal.throwIfAborted()
+      if (module == null) return { module: null }
       const data = this.moduleData(module)
-      const graph = await this.resolveGraph(
-        module,
-        options.importer?.resolve,
-        resolutions,
-        true,
-        signal
-      )
-      return { module: dataForModule({ ...data, graph }) }
+      imported.add(module)
+      // Static imports are resolved here in one round trip, not in the link job (a documented deviation).
+      const graph =
+        data.graph ??
+        (module.requests.length
+          ? await this.resolveGraph(module, options.importer.resolve, resolutions, signal)
+          : undefined)
+      return { module: dataForModule({ ...data, graph }, transport.held) }
     }
     const runtime = new Runtime(
       this,
       transport,
-      () => this.runtimes.delete(runtime),
+      () => {
+        this.runtimes.delete(runtime)
+        this.runtimeTransports.delete(transport)
+      },
       resolutions,
       options
     )
     this.runtimes.add(runtime)
+    this.runtimeTransports.add(transport)
     try {
       const { importer, network, eventLoop, onPromiseRejection, ...runtimeOptions } = options
       await transport.request("newRuntime", {
         ...runtimeOptions,
+        maxSteps,
         importer: Boolean(importer),
+        importerResolve: Boolean(importer?.resolve),
         importerMeta: Boolean(importer?.meta),
         network: networkWireOptions(network),
-        loopOptions: {
-          onError: Boolean(eventLoop?.onError),
-          resetMemoryPerTask: eventLoop?.resetMemoryPerTask ?? false
-        },
-        trackRejections: Boolean(onPromiseRejection)
+        loopOptions: loopWireOptions(transport, eventLoop),
+        rejectionTracker: rejectionTrackerWire(transport, onPromiseRejection)
       })
       transport.enableRecovery()
       await runtime.network.initialize()
@@ -555,39 +687,49 @@ export class Engine {
     } catch (error) {
       await runtime.close()
       throw error
+    } finally {
+      this.refillWarm()
     }
   }
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
     await Promise.all([
-      ...[...this.compilers].map((compiler) =>
-        compiler.stop(failure("closed", "MoeJS engine is closed"))
+      ...[...this.compilers, ...this.warm.splice(0)].map((transport) =>
+        transport.stop(failure("closed", "MoeJS engine is closed"))
       ),
       ...[...this.runtimes].map((runtime) => runtime.close())
     ])
     this.runtimes.clear()
     this.compilers.clear()
     this.descriptors.clear()
+    this.referrers.clear()
+    this.runtimeTransports.clear()
   }
 }
 
-function dataForModule(data: ModuleData) {
+function moduleBytecode(data: ModuleData, held: boolean) {
+  return held ? { held: true } : { code: data.code, earlyCode: data.earlyCode }
+}
+function descriptorId(data: ModuleData) {
+  return data.linkId ?? data.moduleId
+}
+function dataForModule(data: ModuleData, held?: ReadonlySet<number>) {
   return {
     moduleId: data.moduleId,
+    linkId: data.linkId,
     name: data.name,
-    source: data.source,
     typeScript: data.typeScript,
-    code: data.code,
-    earlyCode: data.earlyCode,
+    ...moduleBytecode(data, held?.has(data.moduleId) ?? false),
     modules: data.graph
       ? [...data.graph.values()].map(({ data: item, resolutions }) => ({
           moduleId: item.moduleId,
           name: item.name,
-          source: item.source,
           typeScript: item.typeScript,
-          code: item.code,
-          earlyCode: item.earlyCode,
+          ...moduleBytecode(
+            item,
+            item.moduleId === data.moduleId || (held?.has(item.moduleId) ?? false)
+          ),
           resolutions: Object.fromEntries(
             [...resolutions].map(([specifier, dependency]) => [specifier, dependency.moduleId])
           )
@@ -598,7 +740,6 @@ function dataForModule(data: ModuleData) {
 
 export class Runtime {
   private loaded?: Module
-  private rejectionTracker?: (event: PromiseRejectionEvent) => void
   readonly eventLoop: EventLoop
   readonly network: RuntimeNetwork
 
@@ -607,29 +748,12 @@ export class Runtime {
     private readonly engine: Engine,
     private readonly transport: Transport,
     private readonly onClose: () => void,
-    private readonly resolutions: Map<string, Promise<Module>>,
-    options: RuntimeOptions = {}
+    private readonly resolutions: Map<string, unknown>,
+    private readonly options: RuntimeOptions = {}
   ) {
-    this.eventLoop = new EventLoop(transport)
+    this.eventLoop = new EventLoop(transport, this)
     this.network = new RuntimeNetwork(transport, options.network)
-    this.rejectionTracker = options.onPromiseRejection
     transport.networkRequest = (message) => this.network.handle(message)
-    transport.event = (message) => {
-      if (message.kind === "loopError" && message.error) options.eventLoop?.onError?.(message.error)
-      if (
-        message.kind === "promiseRejection" &&
-        message.promise &&
-        message.result &&
-        message.state &&
-        message.operation
-      )
-        this.rejectionTracker?.({
-          operation: message.operation,
-          promise: transport.decode(message.promise) as Value,
-          state: message.state,
-          result: transport.decode(message.result) as Value
-        })
-    }
   }
   native(root: "runtime" | "realm" | "engine" | "moejs" = "runtime"): Promise<NativeHandle> {
     return nativeRoot(this.transport, root)
@@ -643,13 +767,12 @@ export class Runtime {
   async module(): Promise<Module | NativeHandle | null> {
     const current = await this.transport.control<{ moduleId: number } | null>("module")
     if (!current) return null
-    if (current.moduleId === modules.get(this.loaded!)?.moduleId) return this.loaded!
+    const loaded = this.loaded && modules.get(this.loaded)
+    if (loaded && current.moduleId === descriptorId(loaded)) return this.loaded!
     return (await this.native()).invoke<NativeHandle>("Module")
   }
   async thrownValue(error: unknown): Promise<{ value: Value; ok: boolean }> {
-    const payload = error == null ? undefined : errorPayload(error)
-    if (payload && error instanceof MoeJSError && error.value !== undefined)
-      payload.value = this.transport.encode(error.value)
+    const payload = error == null ? undefined : this.transport.hostThrowPayload(error)
     const result = await this.transport.control<{ value: WireValue; ok: boolean }>("thrownValue", {
       error: payload
     })
@@ -664,50 +787,45 @@ export class Runtime {
   async setGlobal(name: string, value: unknown): Promise<void> {
     await this.transport.request("setGlobal", { name, value: this.transport.encode(value) })
   }
+  /** Runtime.Function: like a NativeFunc, the callback gets live Value arguments valid during the call. */
   function(
     name: string,
     length: number,
     callback: HostFunction,
     options: { async?: boolean } = {}
   ) {
-    return defineHostFunction(callback, { name, length, async: options.async ?? false })
+    return defineHostFunction(callback, { name, length, async: options.async ?? false, raw: true })
   }
   async load(module: Module, options: RequestOptions = {}): Promise<void> {
     this.transport.assertUsable()
     const data = modules.get(module)
     if (!data || data.engine !== this.engine)
       throw failure("bridge", "Module belongs to a different MoeJS engine")
-    if (this.loaded) throw failure("bridge", "A MoeJS runtime can load only one module")
-    this.loaded = module
-    for (const [id, record] of data.graph ?? [])
-      for (const [specifier, dependency] of record.resolutions)
-        this.resolutions.set(`module:${id}:${specifier}`, Promise.resolve(dependency.descriptor!))
     try {
-      await this.transport.request("load", dataForModule(data), options)
+      await this.transport.request("load", dataForModule(data, this.transport.held), options)
+      this.loaded = module
     } catch (error) {
-      if (!this.transport.isStopped) {
-        const current = await this.transport.control<{ moduleId: number } | null>("module")
-        if (!current) this.loaded = undefined
+      // ErrModulePending leaves the module loaded and evaluating, as Runtime.Load does.
+      if (this.loaded === undefined && !this.transport.isStopped) {
+        if (error instanceof MoeJSError && error.code === "ERR_MODULE_PENDING") this.loaded = module
+        else {
+          const current = await this.transport.control<{ moduleId: number } | null>("module")
+          if (current?.moduleId === descriptorId(data)) this.loaded = module
+        }
       }
       throw error
     }
   }
-  private hookData(hook: Hook) {
+  /** Go rebuilds the Hook from its own module; upstream lookup decides what it names. */
+  private hookPayload(hook: Hook) {
     this.transport.assertUsable()
     const data = hooks.has(hook) ? modules.get(hook.module) : undefined
-    if (
-      !data ||
-      data.engine !== this.engine ||
-      modules.get(this.loaded!)?.moduleId !== data.moduleId
-    )
-      throw failure("bridge", "Hook must refer to a module loaded in this runtime")
-    if (hook.module !== this.loaded && !data.ownExports.includes(hook.path[0]!)) return undefined
-    return data
+    if (!data || data.engine !== this.engine)
+      throw failure("bridge", "Hook belongs to a different MoeJS engine")
+    return { moduleId: data.moduleId, linkId: data.linkId, path: [...hook.path] }
   }
   async has(hook: Hook): Promise<boolean> {
-    const data = this.hookData(hook)
-    if (!data) return false
-    return this.transport.request("has", { moduleId: data.moduleId, path: [...hook.path] })
+    return this.transport.request("has", this.hookPayload(hook))
   }
   async call<T = unknown>(hook: Hook, ...args: unknown[]): Promise<T> {
     return this.callWith<T>(hook, args)
@@ -717,61 +835,46 @@ export class Runtime {
     args: readonly unknown[],
     options: RequestOptions = {}
   ): Promise<T> {
-    const data = this.hookData(hook)
-    if (!data)
-      throw new MoeJSError({
-        kind: "bridge",
-        name: "errorString",
-        message: "moejs: hook not found"
-      })
+    const payload = this.hookPayload(hook)
     return this.transport.decode(
       await this.transport.request<WireValue>(
         "call",
-        {
-          moduleId: data.moduleId,
-          path: [...hook.path],
-          args: args.map((value) => this.transport.encode(value))
-        },
+        { ...payload, args: args.map((value) => this.transport.encode(value)) },
         options
       )
     ) as T
   }
   async callValue(hook: Hook, ...args: unknown[]): Promise<Value> {
-    const data = this.hookData(hook)
-    if (!data)
-      throw new MoeJSError({
-        kind: "bridge",
-        name: "errorString",
-        message: "moejs: hook not found"
-      })
+    const payload = this.hookPayload(hook)
     return this.transport.decode(
       await this.transport.request<WireValue>("call", {
-        moduleId: data.moduleId,
-        path: [...hook.path],
+        ...payload,
         args: args.map((value) => this.transport.encode(value)),
         raw: true
       })
     ) as Value
   }
-  private scriptData(script: Script) {
+  private async runScriptWire(script: Script, raw: boolean, options: RequestOptions) {
     const data = scripts.get(script)
     if (!data || data.engine !== this.engine)
       throw failure("bridge", "Script belongs to a different MoeJS engine")
-    return { scriptId: data.scriptId, name: data.name, code: data.code }
+    const result = await this.transport.request<WireValue>(
+      "runScript",
+      {
+        scriptId: data.scriptId,
+        name: data.name,
+        ...(this.transport.held.has(data.scriptId) ? { held: true } : { code: data.code }),
+        raw
+      },
+      options
+    )
+    return this.transport.decode(result)
   }
   async runScript<T = unknown>(script: Script, options: RequestOptions = {}): Promise<T> {
-    return this.transport.decode(
-      await this.transport.request<WireValue>("runScript", this.scriptData(script), options)
-    ) as T
+    return (await this.runScriptWire(script, false, options)) as T
   }
   async runScriptValue(script: Script, options: RequestOptions = {}): Promise<Value> {
-    return this.transport.decode(
-      await this.transport.request<WireValue>(
-        "runScript",
-        { ...this.scriptData(script), raw: true },
-        options
-      )
-    ) as Value
+    return (await this.runScriptWire(script, true, options)) as Value
   }
   async get<T = unknown>(...path: string[]): Promise<T> {
     return this.transport.decode(await this.transport.request<WireValue>("get", { path })) as T
@@ -826,8 +929,110 @@ export class Runtime {
       await this.transport.request<WireValue>("valueParseJSON", { json })
     ) as Value
   }
-  getProperty(value: Value, key: string): Promise<Value> {
-    return value.get(key)
+  getProperty(
+    value: Value,
+    key: PropertyKey,
+    options: { receiver?: unknown } = {}
+  ): Promise<Value> {
+    return value.get(key, options)
+  }
+  private async valueOp<T>(op: "valueOp" | "valuePure", method: string, payload: object = {}) {
+    return this.transport.request<T>(op, { method, ...payload })
+  }
+  private async valueResult<T>(op: "valueOp" | "valuePure", method: string, payload: object = {}) {
+    const wire = await this.valueOp<WireValue | null>(op, method, payload)
+    return (wire === null ? wire : this.transport.decode(wire)) as T
+  }
+  private operands(...values: unknown[]) {
+    return { args: values.map((value) => this.transport.encode(value)) }
+  }
+  construct(fn: Value, args: readonly unknown[] = [], newTarget?: Value): Promise<Value> {
+    return fn.construct(args, newTarget)
+  }
+  newObject(): Promise<Value> {
+    return this.valueResult("valuePure", "NewObject")
+  }
+  newObjectWithProto(proto: Value | null): Promise<Value> {
+    return this.valueResult("valuePure", "NewObjectWithProto", this.operands(proto))
+  }
+  newArray(...items: unknown[]): Promise<Value> {
+    return this.valueResult("valueOp", "NewArray", this.operands(...items))
+  }
+  newArrayLen(length: number): Promise<Value> {
+    return this.valueResult("valuePure", "NewArrayLen", this.operands(length))
+  }
+  newRegExp(pattern: string, flags = ""): Promise<Value> {
+    return this.valueResult("valueOp", "NewRegExp", this.operands(pattern, flags))
+  }
+  /** NewArrayBuffer over a copy of the bytes: they cannot be shared across the boundary. */
+  newArrayBuffer(data: ArrayBuffer | ArrayBufferView): Promise<Value> {
+    const bytes = ArrayBuffer.isView(data)
+      ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice()
+      : new Uint8Array(data).slice()
+    return this.fromHost(bytes.buffer)
+  }
+  async detachArrayBuffer(buffer: Value): Promise<void> {
+    await this.valueOp("valuePure", "DetachArrayBuffer", this.operands(buffer))
+  }
+  sameValue(a: unknown, b: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "SameValue", this.operands(a, b))
+  }
+  sameValueZero(a: unknown, b: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "SameValueZero", this.operands(a, b))
+  }
+  strictEquals(a: unknown, b: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "StrictEquals", this.operands(a, b))
+  }
+  looseEquals(a: unknown, b: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "LooseEquals", this.operands(a, b))
+  }
+  /** Realm.IsLessThan: undefined when either side is NaN. */
+  async isLessThan(x: unknown, y: unknown, leftFirst = true): Promise<boolean | undefined> {
+    return (
+      (await this.valueOp<boolean | null>(
+        "valueOp",
+        "IsLessThan",
+        this.operands(x, y, leftFirst)
+      )) ?? undefined
+    )
+  }
+  lessThan(x: unknown, y: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "LessThan", this.operands(x, y))
+  }
+  greaterThan(x: unknown, y: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "GreaterThan", this.operands(x, y))
+  }
+  lessThanOrEqual(x: unknown, y: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "LessThanOrEqual", this.operands(x, y))
+  }
+  greaterThanOrEqual(x: unknown, y: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "GreaterThanOrEqual", this.operands(x, y))
+  }
+  add(a: unknown, b: unknown): Promise<unknown> {
+    return this.valueResult("valueOp", "Add", this.operands(a, b))
+  }
+  instanceOf(value: unknown, target: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "InstanceOf", this.operands(value, target))
+  }
+  ordinaryHasInstance(c: unknown, o: unknown): Promise<boolean> {
+    return this.valueOp("valueOp", "OrdinaryHasInstance", this.operands(c, o))
+  }
+  async stringToBigInt(text: string): Promise<bigint | undefined> {
+    return (
+      (await this.valueResult<bigint | null>("valuePure", "StringToBigInt", this.operands(text))) ??
+      undefined
+    )
+  }
+  global(): Promise<Value> {
+    return this.valueResult("valuePure", "Global")
+  }
+  /** A Realm intrinsic field; null for a lazy one not built yet. */
+  intrinsic(name: IntrinsicName): Promise<Value | null> {
+    return this.valueResult("valuePure", "Intrinsic", { name })
+  }
+  /** Runtime.FromGo: lazy containers with sorted keys, as a Go host's map would convert. */
+  fromGo(value: unknown): Promise<Value> {
+    return this.valueResult("valueOp", "FromGo", { value: this.transport.encode(value) })
   }
   async callFunction<T = unknown>(fn: Value, thisValue: unknown, ...args: unknown[]): Promise<T> {
     return this.transport.decode(
@@ -888,17 +1093,31 @@ export class Runtime {
   ) {
     return value.toGoIntoWith(targetOrOptions, options)
   }
+  /** Runtime.NewPromise: settles at once and does not hold the loop; see eventLoop.newPromise(). */
   newPromise() {
-    return createHostPromise(this.transport)
+    return createRuntimePromise(this.transport)
   }
-  promiseState(value: Value) {
+  /** webapi.Install for a runtime created with webAPI: false, once, with its network options. */
+  async installWebAPI(): Promise<void> {
+    await this.transport.request("installWebAPI", {
+      network: networkWireOptions(this.options.network)
+    })
+  }
+  /** eventloop.New after the previous loop was terminated, or on a bare runtime; it is not started. */
+  async newEventLoop(options: EventLoopOptions = {}): Promise<void> {
+    await this.transport.control("loopNew", {
+      loopOptions: loopWireOptions(this.transport, options)
+    })
+  }
+  promiseState(value: unknown) {
     return inspectPromise(this.transport, value)
   }
   async setPromiseRejectionTracker(
-    callback?: (event: PromiseRejectionEvent) => void
+    callback?: (event: PromiseRejectionEvent) => unknown
   ): Promise<void> {
-    await setPromiseRejectionTracker(this.transport, Boolean(callback))
-    this.rejectionTracker = callback
+    await this.transport.request("setPromiseRejectionTracker", {
+      rejectionTracker: rejectionTrackerWire(this.transport, callback)
+    })
   }
   async stats(): Promise<Stats> {
     return this.transport.request<Stats>("stats")
@@ -941,6 +1160,13 @@ export class Runtime {
     if (roots) await (await this.native()).invoke("RebaseAllocation", this.nativeRoots(roots))
     else await this.transport.request("rebaseAllocation")
   }
+  /** Realm.MeasureLive: measures with or without a memory limit and changes no counter. */
+  async measureLive(roots?: LiveRoots | readonly Value[]): Promise<number> {
+    return (await this.native("realm")).invoke<number>(
+      "MeasureLive",
+      roots ? this.nativeRoots(roots) : null
+    )
+  }
   interrupt(reason?: unknown): void {
     this.transport.interrupt(reason)
   }
@@ -959,7 +1185,7 @@ export class Runtime {
 }
 
 export async function createMoeJS(options: CoreOptions): Promise<Engine> {
-  timeout(options.timeoutMs)
+  checkTimeout(options.timeoutMs ?? defaultTimeoutMs)
   const module = await options.adapter.loadModule(options.wasmURL)
   const engine = new Engine(module, options)
   try {
