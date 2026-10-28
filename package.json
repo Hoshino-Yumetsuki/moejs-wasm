@@ -1,6 +1,6 @@
 {
   "name": "moejs-wasm",
-  "version": "1.0.0-beta.1",
+  "version": "1.0.0-beta.2",
   "description": "Isolated MoeJS JavaScript and TypeScript runtimes powered by Go WebAssembly workers",
   "type": "module",
   "main": "lib/node.cjs",
