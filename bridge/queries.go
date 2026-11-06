@@ -2,7 +2,7 @@
 
 package main
 
-import "github.com/Calcium-Ion/moejs"
+import "github.com/MoeForge/moejs"
 
 // Error introspection must work even while a recoverable interrupt is pending.
 func (b *bridge) queryError(op string, p *payload) (any, error) {

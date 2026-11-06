@@ -17,7 +17,7 @@ yarn format:check
 node examples/node.mjs
 ```
 
-`external/moejs` 是 Git submodule。构建产物位于 `lib/`，发布包已包含这些产物，使用时无需安装 Go。
+`external/moejs` 是 Git submodule，当前固定到上游 [`df42231`](https://github.com/MoeForge/moejs/commit/df42231a9559cfdd6d2594317a8675a48a93c2b8)，Go 模块路径为 `github.com/MoeForge/moejs`。构建产物位于 `lib/`，发布包已包含这些产物，使用时无需安装 Go。
 
 请使用 `yarn build` 构建。该命令通过临时 Go overlay 和生成的注册表接入完整功能。
 

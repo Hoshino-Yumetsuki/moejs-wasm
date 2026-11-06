@@ -13,9 +13,9 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/Calcium-Ion/moejs/bytecode"
-	"github.com/Calcium-Ion/moejs/compiler"
-	"github.com/Calcium-Ion/moejs/syntax"
+	"github.com/MoeForge/moejs/bytecode"
+	"github.com/MoeForge/moejs/compiler"
+	"github.com/MoeForge/moejs/syntax"
 )
 
 // These artifacts are private endpoint messages, not a public bytecode API.

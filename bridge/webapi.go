@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Calcium-Ion/moejs/webapi"
+	"github.com/MoeForge/moejs/webapi"
 )
 
 type networkOptions struct {

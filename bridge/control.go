@@ -3,8 +3,8 @@
 package main
 
 import (
-	"github.com/Calcium-Ion/moejs"
-	"github.com/Calcium-Ion/moejs/eventloop"
+	"github.com/MoeForge/moejs"
+	"github.com/MoeForge/moejs/eventloop"
 )
 
 type loopOptions struct {

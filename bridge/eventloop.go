@@ -7,9 +7,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/Calcium-Ion/moejs"
-	"github.com/Calcium-Ion/moejs/eventloop"
-	"github.com/Calcium-Ion/moejs/webapi"
+	"github.com/MoeForge/moejs"
+	"github.com/MoeForge/moejs/eventloop"
+	"github.com/MoeForge/moejs/webapi"
 )
 
 // The control lock serializes access while the native loop is paused.

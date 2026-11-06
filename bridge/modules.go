@@ -7,9 +7,9 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/Calcium-Ion/moejs"
-	"github.com/Calcium-Ion/moejs/bytecode"
-	"github.com/Calcium-Ion/moejs/engine"
+	"github.com/MoeForge/moejs"
+	"github.com/MoeForge/moejs/bytecode"
+	"github.com/MoeForge/moejs/engine"
 )
 
 type moduleSource struct {

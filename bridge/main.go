@@ -14,8 +14,8 @@ import (
 	"time"
 	_ "time/tzdata"
 
-	"github.com/Calcium-Ion/moejs"
-	"github.com/Calcium-Ion/moejs/bytecode"
+	"github.com/MoeForge/moejs"
+	"github.com/MoeForge/moejs/bytecode"
 )
 
 const defaultMaxSteps int64 = 1_000_000

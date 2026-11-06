@@ -5,8 +5,8 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
-	"github.com/Calcium-Ion/moejs"
-	"github.com/Calcium-Ion/moejs/engine"
+	"github.com/MoeForge/moejs"
+	"github.com/MoeForge/moejs/engine"
 	"math/big"
 	"reflect"
 	"runtime"

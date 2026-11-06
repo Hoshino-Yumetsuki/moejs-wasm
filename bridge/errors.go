@@ -9,11 +9,11 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/Calcium-Ion/moejs"
-	"github.com/Calcium-Ion/moejs/compiler"
-	"github.com/Calcium-Ion/moejs/engine"
-	"github.com/Calcium-Ion/moejs/eventloop"
-	"github.com/Calcium-Ion/moejs/syntax"
+	"github.com/MoeForge/moejs"
+	"github.com/MoeForge/moejs/compiler"
+	"github.com/MoeForge/moejs/engine"
+	"github.com/MoeForge/moejs/eventloop"
+	"github.com/MoeForge/moejs/syntax"
 )
 
 type errorPayload struct {
