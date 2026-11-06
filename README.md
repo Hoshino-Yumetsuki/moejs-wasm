@@ -21,6 +21,8 @@ node examples/node.mjs
 
 请使用 `yarn build` 构建。该命令通过临时 Go overlay 和生成的注册表接入完整功能。
 
+`yarn format` 使用 Oxfmt 格式化前端源码、脚本和文档，并使用 gofmt 格式化 `bridge/` 与 `scripts/native-registry/` 下的 Go 文件；`yarn format:check` 只检查，格式不符时返回非零退出码。上游子模块 `external/moejs` 不参与格式化。
+
 ## Node.js
 
 ```ts

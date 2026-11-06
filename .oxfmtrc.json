@@ -7,5 +7,5 @@
   "endOfLine": "lf",
   "trailingComma": "none",
   "sortPackageJson": false,
-  "ignorePatterns": ["node_modules", "lib", "coverage", "external", "yarn.lock"]
+  "ignorePatterns": ["node_modules", "lib", "coverage", "external/**", "yarn.lock"]
 }

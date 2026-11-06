@@ -87,9 +87,9 @@
   "scripts": {
     "build": "tsdown && node scripts/build-wasm.mjs",
     "lint": "oxlint",
-    "lint-fix": "oxlint --fix && oxfmt",
-    "format": "oxfmt",
-    "format:check": "oxfmt --check",
+    "lint-fix": "oxlint --fix && yarn format",
+    "format": "oxfmt && node scripts/format-go.mjs",
+    "format:check": "oxfmt --check && node scripts/format-go.mjs --check",
     "test": "vitest run --root test",
     "bench": "node bench/bench.mjs"
   },
