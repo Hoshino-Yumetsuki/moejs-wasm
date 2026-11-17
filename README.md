@@ -4,7 +4,7 @@
 
 ## 构建
 
-需要 Go 1.25+、Node.js 22+、Corepack 和 Yarn 4。无需 C 工具链或 Emscripten。
+需要 Go 1.27.3+、Node.js 22+、Corepack 和 Yarn 4。无需 C 工具链或 Emscripten。
 
 ```sh
 git submodule update --init --recursive
@@ -17,9 +17,11 @@ yarn format:check
 node examples/node.mjs
 ```
 
-`external/moejs` 是 Git submodule，当前固定到上游 [`df42231`](https://github.com/MoeForge/moejs/commit/df42231a9559cfdd6d2594317a8675a48a93c2b8)，Go 模块路径为 `github.com/MoeForge/moejs`。构建产物位于 `lib/`，发布包已包含这些产物，使用时无需安装 Go。
+`external/moejs` 是 Git submodule，当前固定到上游 [`b7f49c1`](https://github.com/MoeForge/moejs/commit/b7f49c1f7e502a593d65d4cd9ae3a0b2c3bda070)，Go 模块路径为 `github.com/MoeForge/moejs`。构建产物位于 `lib/`，发布包已包含这些产物，使用时无需安装 Go。
 
 请使用 `yarn build` 构建。该命令通过临时 Go overlay 和生成的注册表接入完整功能。
+
+本次同步引入 `moego v0.1.0-alpha.3` 依赖，并将端点间私有字节码格式升级为 v3，以适配上游的新指令编码和 `ForwardArguments` 字段；旧格式会被拒绝，部署时请一并更新 worker 与 WASM。
 
 `yarn format` 使用 Oxfmt 格式化前端源码、脚本和文档，并使用 gofmt 格式化 `bridge/` 与 `scripts/native-registry/` 下的 Go 文件；`yarn format:check` 只检查，格式不符时返回非零退出码。上游子模块 `external/moejs` 不参与格式化。
 
@@ -295,6 +297,8 @@ await object.release()
 
 独立沙盒请使用 `engine.newRuntime()`。原生 API 遵循 MoeJS 的调用约定和前置条件。
 
+上游新增的 `Runtime.RunContext` 可通过原生 Runtime 句柄的 `invoke("RunContext", context, callback)` 调用：`context` 必须是同一 Runtime 中的 Go `context.Context` 句柄，回调收到 Runtime 原生句柄。JS 请求取消仍使用 `signal`／`timeoutMs`。上游已移除 `FunctionData.SetNative`、`FunctionData.SetConstructor` 和 `ArrayData`，原生接口同步移除。
+
 ### 自定义解码
 
 `newDecodeTarget()` 创建 Go 解码目标，供 `unmarshal*` 和 `toGoInto*` 使用。目标会原地更新并作为 `NativeHandle` 返回。
@@ -344,7 +348,7 @@ await remove()
 
 `rt.eventLoop` 提供 `start()`、`run()`、`stop()`、`post()`、`interrupt()` 和 `terminate()` 等控制方法。`newRuntime()` 会自动启动事件循环，第一次 `start()` 或 `run()` 接管这次启动，此后与 MoeJS 一样，循环已在运行时再次调用会以 `ERR_LOOP_RUNNING` 拒绝。`run(fn)` 先在循环上调用 `fn`，`fn` 抛出时 `run()` 以该错误拒绝。不带任务的 `runOnLoop()`／`post()` 只报告循环是否存活；宿主任务的参数是 Runtime。`eventLoop.onError(error)` 在循环上同步运行，`error` 是 `MoeJSError`，其中的 `Value` 在回调结束后仍可使用。`newRuntime({ eventLoop: false })` 得到没有定时器、Web API 和事件循环的 Runtime；`rt.newEventLoop()` 在这种 Runtime 上或 `terminate()` 之后创建新的循环（不会自动启动），Web API 仍绑定在第一个循环上。`eventLoop.onError` 可处理原生回调错误，`eventLoop.resetMemoryPerTask` 可按任务重置分配预算。与 MoeJS `Loop.Run` 一致，`run(options?)` 默认没有截止时间，可传入 `timeoutMs` 或 `signal`。
 
-`post()` 支持同步和异步宿主任务，任务错误由 `onError` 或 `run()` 的拒绝处理。
+`post()` 支持同步和异步宿主任务，任务错误由 `onError` 或 `run()` 的拒绝处理。`eventLoop.onIdle()` 在循环等待前调用，`eventLoop.onWake()` 在等待后有任务可执行时、执行之前调用；两者均等待异步回调。`onIdle` 抛出或拒绝的错误与 `onError` 的错误一样被忽略；`onWake` 的错误停止循环并传给 `run()` 或 `stop()`，保留待执行任务且不中断 Runtime，可再次运行。循环停止、终止或无需继续运行时，空闲后可能没有 `onWake`。回调运行在循环上，不要在其中等待 `stop()` 或 `terminate()`，否则可能死锁；若 `onWake` 等待外部资源，停止或终止前应先解除该等待。
 
 ## 运行时限制、恢复与错误
 
@@ -368,4 +372,4 @@ Go 指针与函数通过句柄管理，Go 目标通过反射类型映射。
 
 Apache-2.0
 
-MoeJS 使用 Apache-2.0，Go 运行时使用 BSD 许可证。相关许可证和第三方声明随发布包提供。
+MoeJS 使用 Apache-2.0，Go 运行时使用 BSD 许可证，moego 使用 MIT 许可证。相关许可证和第三方声明随发布包提供；构建时会从当前依赖版本复制 `LICENSE-moego`。
