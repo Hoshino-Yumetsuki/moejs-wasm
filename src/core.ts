@@ -246,6 +246,8 @@ function loopWireOptions(transport: Transport, options: EventLoopOptions | false
           )
         )
       : undefined,
+    onIdle: options?.onIdle ? transport.encode(defineHostFunction(options.onIdle)) : undefined,
+    onWake: options?.onWake ? transport.encode(defineHostFunction(options.onWake)) : undefined,
     resetMemoryPerTask: options?.resetMemoryPerTask ?? false
   }
 }

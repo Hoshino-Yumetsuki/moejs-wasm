@@ -6,6 +6,10 @@ import type { Runtime } from "./core"
 export interface EventLoopOptions {
   /** Runs synchronously on the loop, before the next callback. */
   onError?: (error: MoeJSError) => unknown
+  /** Runs before the loop waits; errors are ignored, as with onError. */
+  onIdle?: () => unknown
+  /** Runs before work resumes; a rejection stops the loop without discarding work. */
+  onWake?: () => unknown
   resetMemoryPerTask?: boolean
 }
 

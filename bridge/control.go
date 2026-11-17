@@ -10,6 +10,8 @@ import (
 type loopOptions struct {
 	Disabled           bool      `json:"disabled"`
 	OnError            wireValue `json:"onError"`
+	OnIdle             wireValue `json:"onIdle"`
+	OnWake             wireValue `json:"onWake"`
 	ResetMemoryPerTask bool      `json:"resetMemoryPerTask"`
 }
 

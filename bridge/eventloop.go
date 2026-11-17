@@ -94,6 +94,17 @@ func (b *bridge) initializeLoop(o *loopOptions) error {
 		if cb, ok := o.OnError.V.(*hostCallback); ok {
 			opts.OnError = b.loopErrorHandler(cb)
 		}
+		if cb, ok := o.OnIdle.V.(*hostCallback); ok {
+			opts.OnIdle = func() {
+				_, _ = b.callHost(cb.id, []wireValue{}, wireValue{T: "undefined"})
+			}
+		}
+		if cb, ok := o.OnWake.V.(*hostCallback); ok {
+			opts.OnWake = func() error {
+				_, err := b.callHost(cb.id, []wireValue{}, wireValue{T: "undefined"})
+				return err
+			}
+		}
 	}
 	loop, err := eventloop.New(b.rt, opts)
 	if err != nil {
