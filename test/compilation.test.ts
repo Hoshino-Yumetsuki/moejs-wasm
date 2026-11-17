@@ -171,20 +171,63 @@ it("creates reusable sync, async, generator and async-generator function handles
   }
 }, 30_000)
 
-it("rejects malformed artifact imports without poisoning the runtime", async () => {
-  let corrupt = true
-  const engine = await create(
-    artifactAdapter((request) => {
-      if (request.op !== "runScript" || !corrupt) return request
-      corrupt = false
-      return { ...request, payload: { ...request.payload, code: "AAAA" } }
-    })
+it("preserves forwarded arguments and spilled bindings across bytecode endpoints", async () => {
+  const engine = await create()
+  const bindings = Array.from({ length: 300 }, (_, i) => `v${i} = seed + ${i}`).join(", ")
+  const sum = Array.from({ length: 300 }, (_, i) => `v${i}`).join(" + ")
+  const module = await engine.compile(
+    "arguments.js",
+    `
+    function collect() { return [this.base, arguments.length, arguments[0], arguments[1]] }
+    export function forward() { return collect.apply({ base: 40 }, arguments) }
+    export function wide(seed) { let ${bindings}; return ${sum} }
+    export function classify(value) {
+      if (value === null) return "null";
+      if (value === undefined) return "undefined";
+      return typeof value;
+    }
+  `
   )
-  const script = await engine.compileScript("valid.js", "21 * 2")
   const runtime = await engine.newRuntime()
-  await expect(runtime.runScript(script)).rejects.toThrow("bytecode artifact")
-  expect(await runtime.runScript(script)).toBe(42)
+  await runtime.load(module)
+  expect(await runtime.call(module.hook("forward"), 1, 2)).toEqual([40, 2, 1, 2])
+  expect(await runtime.call(module.hook("wide"), 1)).toBe(45_150)
+  for (const [value, kind] of [
+    [null, "null"],
+    [undefined, "undefined"],
+    [42, "number"]
+  ]) {
+    expect(await runtime.call(module.hook("classify"), value)).toBe(kind)
+  }
 }, 30_000)
+
+it.each(["malformed", "previous version"])(
+  "rejects %s artifacts without poisoning the runtime",
+  async (variant) => {
+    let corrupt = true
+    const engine = await create(
+      artifactAdapter((request) => {
+        if (request.op !== "runScript" || !corrupt) return request
+        corrupt = false
+        let code = "AAAA"
+        if (variant === "previous version") {
+          if (!("code" in request.payload) || typeof request.payload.code !== "string") {
+            throw new Error("expected a compiled script artifact")
+          }
+          const bytes = Buffer.from(request.payload.code, "base64")
+          bytes.write("moejs-wasm-bytecode-2\0")
+          code = bytes.toString("base64")
+        }
+        return { ...request, payload: { ...request.payload, code } }
+      })
+    )
+    const script = await engine.compileScript("valid.js", "21 * 2")
+    const runtime = await engine.newRuntime()
+    await expect(runtime.runScript(script)).rejects.toThrow("bytecode artifact")
+    expect(await runtime.runScript(script)).toBe(42)
+  },
+  30_000
+)
 
 it("sends each endpoint a module's or script's bytecode once", async () => {
   const sent: WorkerRequest[] = []

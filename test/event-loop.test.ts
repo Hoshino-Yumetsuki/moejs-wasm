@@ -21,6 +21,94 @@ async function setup(source: string, options: Parameters<Engine["newRuntime"]>[0
   return { engine, rt, mod, hook: (name: string) => mod.hook(name) }
 }
 
+it("waits for onWake before running queued work", async () => {
+  const idle = Promise.withResolvers<void>()
+  const wake = Promise.withResolvers<void>()
+  const gate = Promise.withResolvers<void>()
+  const order: string[] = []
+  const { rt } = await setup("export const x = 1", { eventLoop: false })
+  await rt.newEventLoop({
+    onIdle() {
+      order.push("idle")
+      idle.resolve()
+      throw new Error("ignored idle error")
+    },
+    async onWake() {
+      order.push("wake")
+      wake.resolve()
+      await gate.promise
+    }
+  })
+  const release = await rt.eventLoop.hold()
+  const running = rt.eventLoop.run()
+  await idle.promise
+  const posted = rt.eventLoop.post(() => {
+    order.push("task")
+  })
+  await wake.promise
+  expect(order).toEqual(["idle", "wake"])
+  gate.resolve()
+  await posted
+  await release()
+  await running
+  expect(order.slice(0, 3)).toEqual(["idle", "wake", "task"])
+}, 30_000)
+
+it.each(["initial", "bare", "replacement"] as const)(
+  "idle and async wake hooks preserve work on failure (%s loop)",
+  async (kind) => {
+    const idle = Promise.withResolvers<void>()
+    const wake = Promise.withResolvers<void>()
+    const gate = Promise.withResolvers<void>()
+    const order: string[] = []
+    let active = false
+    const options: EventLoopOptions = {
+      onIdle() {
+        if (active) {
+          order.push("idle")
+          idle.resolve()
+        }
+      },
+      async onWake() {
+        if (active) {
+          order.push("wake")
+          wake.resolve()
+          await gate.promise
+          throw new RangeError("wake failed")
+        }
+      }
+    }
+    const { rt } = await setup("export const x = 1", {
+      eventLoop: kind === "bare" ? false : kind === "initial" ? options : undefined
+    })
+    if (kind !== "bare") await rt.eventLoop.stop()
+    if (kind === "replacement") {
+      await rt.eventLoop.terminate()
+      await rt.clearInterrupt()
+    }
+    if (kind !== "initial") await rt.newEventLoop(options)
+    const release = await rt.eventLoop.hold()
+    active = true
+    const running = rt.eventLoop.run()
+    await idle.promise
+    const posted = rt.eventLoop.post(() => {
+      order.push("task")
+    })
+    await wake.promise
+    expect(order).toEqual(["idle", "wake"])
+    gate.resolve()
+    await expect(running).rejects.toMatchObject({ name: "RangeError", message: "wake failed" })
+    active = false
+    expect(await rt.evalScript("check.js", "1")).toBe(1)
+    const resumed = rt.eventLoop.run()
+    await posted
+    await release()
+    await resumed
+    expect(order).toEqual(["idle", "wake", "task"])
+  },
+  30_000
+)
+
 it("onError receives a MoeJSError whose value is a live guest Value", async () => {
   let stashed: Value | undefined
   const seen: unknown[] = []
