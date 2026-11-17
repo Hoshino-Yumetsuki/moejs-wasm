@@ -271,6 +271,11 @@ func (l *Loop) interruptPending() error {
     join(root, "LICENSE-moejs-THIRD_PARTY_NOTICES")
   )
   await copyFile(join(goroot, "LICENSE"), join(root, "LICENSE-go"))
+  const moego = execFileSync(go, ["list", "-m", "-f", "{{.Dir}}", "github.com/MoeForge/moego"], {
+    cwd: root,
+    encoding: "utf8"
+  }).trim()
+  await copyFile(join(moego, "LICENSE"), join(root, "LICENSE-moego"))
   // A lexical globalThis makes syscall/js and Go's timers instance-local. Do not
   // use eval/new Function: the generated factory also runs under Workers CSP.
   await writeFile(

@@ -20,7 +20,7 @@ import (
 
 // These artifacts are private endpoint messages, not a public bytecode API.
 // Version the complete schema, including upstream Function's exported fields.
-const artifactVersion = "moejs-wasm-bytecode-2\x00"
+const artifactVersion = "moejs-wasm-bytecode-3\x00"
 
 // A 9MB bundle encodes to about 18MB and 3M items, and decodes to 35MB.
 const maxArtifactBytes = 256 << 20
