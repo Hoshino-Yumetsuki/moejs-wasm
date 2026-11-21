@@ -81,8 +81,7 @@
     "./wasm_exec.js": "./lib/wasm_exec.js"
   },
   "files": [
-    "lib",
-    "LICENSE-*"
+    "lib"
   ],
   "scripts": {
     "build": "tsdown && node scripts/build-wasm.mjs",

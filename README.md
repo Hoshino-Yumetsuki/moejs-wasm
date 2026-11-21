@@ -370,6 +370,4 @@ Go 指针与函数通过句柄管理，Go 目标通过反射类型映射。
 
 ## 许可证
 
-Apache-2.0
-
-MoeJS 使用 Apache-2.0，Go 运行时使用 BSD 许可证，moego 使用 MIT 许可证。相关许可证和第三方声明随发布包提供；构建时会从当前依赖版本复制 `LICENSE-moego`。
+本项目与 MoeJS 共用根目录的 Apache-2.0 许可证 `LICENSE`。构建时从 MoeJS 子模块、当前 Go 工具链和所用的 moego 模块分别复制 `THIRD_PARTY_NOTICES`、`LICENSE-go`（BSD-3-Clause）和 `LICENSE-moego`（MIT），随发布包放在 `lib/` 中。
